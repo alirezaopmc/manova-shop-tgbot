@@ -1,0 +1,21 @@
+[Unit]
+Description=Manova Shop Telegram Bot (Hetzner Cloud)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opmc
+Group=opmc
+WorkingDirectory=/srv/shop-tgbot/current
+Environment="PATH=/home/opmc/google-cloud-sdk/bin:/home/opmc/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/home/opmc"
+EnvironmentFile=-/etc/manova/shop-tgbot/shopbot.env
+ExecStart=/srv/shop-tgbot/current/shopbot
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
