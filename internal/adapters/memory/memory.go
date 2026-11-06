@@ -67,7 +67,7 @@ func NewStore() *Store {
 		refunds:        make(map[string]*refund.Request),
 		catalogItems:   make(map[string]*catalog.Item),
 		resources:      make(map[string]*billing.ProvisionedResource),
-		marketRate:     105_000, // Default seed market rate 105,000 IRT / USD
+		marketRate:     270_000, // Seed baseline market rate 270,000 IRT / USD (updated dynamically by fxrate.Poller)
 	}
 
 	// Seed default Hetzner CX catalog items

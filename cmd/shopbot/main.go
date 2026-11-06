@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mymmrac/telego"
 
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/fxrate"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/telegram"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
@@ -33,6 +35,21 @@ func main() {
 	defer stop()
 
 	store := memory.NewStore()
+
+	// Initialize live FX rate client & background poller (SwapWallet primary, Wallex fallback)
+	fxClient := fxrate.NewClient(fxrate.ClientConfig{
+		SwapWalletURL: cfg.SwapWalletAPIURL,
+		WallexURL:     cfg.WallexAPIURL,
+		Timeout:       5 * time.Second,
+	}, logger)
+
+	fxPoller := fxrate.NewPoller(
+		store,
+		fxClient,
+		time.Duration(cfg.RatePollIntervalSeconds)*time.Second,
+		logger,
+	)
+	go fxPoller.Start(ctx)
 
 	token := cfg.TelegramBotToken.Expose()
 	if token == "" {
