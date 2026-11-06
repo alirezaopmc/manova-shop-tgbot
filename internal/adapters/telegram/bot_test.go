@@ -8,6 +8,7 @@ import (
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
 
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/hetzner"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
@@ -161,20 +162,20 @@ func TestBuyDraftSession(t *testing.T) {
 }
 
 func TestLocationAndOSLabels(t *testing.T) {
-	if locationName("nbg1") != "🇩🇪 نورنبرگ، آلمان (nbg1)" {
+	if locationName("nbg1") != "nbg1 (Nuremberg, DE)" {
 		t.Errorf("unexpected nbg1 label: %s", locationName("nbg1"))
 	}
-	if locationName("fsn1") != "🇩🇪 فالکن‌اشتاین، آلمان (fsn1)" {
+	if locationName("fsn1") != "fsn1 (Falkenstein, DE)" {
 		t.Errorf("unexpected fsn1 label: %s", locationName("fsn1"))
 	}
-	if locationName("hel1") != "🇫🇮 هلسینکی، فنلاند (hel1)" {
+	if locationName("hel1") != "hel1 (Helsinki, FI)" {
 		t.Errorf("unexpected hel1 label: %s", locationName("hel1"))
 	}
 
 	if osImageLabel("ubuntu-24.04") != "Ubuntu 24.04 LTS" {
 		t.Errorf("unexpected ubuntu label: %s", osImageLabel("ubuntu-24.04"))
 	}
-	if osImageLabel("debian-12") != "Debian 12 (Bookworm)" {
+	if osImageLabel("debian-12") != "Debian 12" {
 		t.Errorf("unexpected debian label: %s", osImageLabel("debian-12"))
 	}
 }
@@ -188,7 +189,8 @@ func TestBuyExecutionAndServerManagement(t *testing.T) {
 		SupportHandle:       "@manova_support",
 	}
 
-	svc := NewService(nil, cfg, store)
+	simProvider := hetzner.NewClient(hetzner.Config{SimulationMode: true})
+	svc := NewService(nil, cfg, store, simProvider)
 
 	userID := int64(887766)
 	usr := user.New(userID, "tester", "Test", "User", user.RoleUser, time.Now().UTC())

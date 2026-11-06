@@ -9,7 +9,7 @@ import (
 
 func TestSimulatorLifecycle(t *testing.T) {
 	ctx := context.Background()
-	client := NewClient(Config{Token: ""})
+	client := NewClient(Config{SimulationMode: true})
 
 	// 1. Create Server with auto root password
 	res, err := client.CreateServer(ctx, "test-srv-1", "cx23", "ubuntu-24.04", "nbg1", nil)
@@ -88,7 +88,7 @@ func TestSimulatorLifecycle(t *testing.T) {
 
 func TestSimulatorWithSSHKey(t *testing.T) {
 	ctx := context.Background()
-	client := NewClient(Config{Token: "simulated"})
+	client := NewClient(Config{SimulationMode: true})
 
 	// Create with SSH key -> root password should be empty
 	res, err := client.CreateServer(ctx, "test-srv-ssh", "cx33", "debian-12", "fsn1", []string{"my-key-id"})
@@ -97,5 +97,43 @@ func TestSimulatorWithSSHKey(t *testing.T) {
 	}
 	if res.RootPassword != "" {
 		t.Errorf("expected empty root password when SSH key provided, got %s", res.RootPassword)
+	}
+}
+
+func TestMissingTokenInProduction(t *testing.T) {
+	ctx := context.Background()
+	// When SimulationMode is false and token is empty -> must fail with ErrMissingToken
+	client := NewClient(Config{Token: "", SimulationMode: false})
+
+	_, err := client.CreateServer(ctx, "real-srv", "cx23", "ubuntu-24.04", "nbg1", nil)
+	if err == nil || err != ErrMissingToken {
+		t.Fatalf("expected ErrMissingToken, got %v", err)
+	}
+
+	if err := client.PowerOn(ctx, "123"); err == nil || err != ErrMissingToken {
+		t.Fatalf("expected ErrMissingToken on PowerOn, got %v", err)
+	}
+}
+
+func TestResourceCaching(t *testing.T) {
+	ctx := context.Background()
+	client := NewClient(Config{SimulationMode: true})
+
+	// 1. Server types cache
+	stList, err := client.ListServerTypes(ctx)
+	if err != nil || len(stList) == 0 {
+		t.Fatalf("ListServerTypes failed: %v", err)
+	}
+
+	// 2. Locations cache
+	locList, err := client.ListLocations(ctx)
+	if err != nil || len(locList) == 0 {
+		t.Fatalf("ListLocations failed: %v", err)
+	}
+
+	// 3. Images cache
+	imgList, err := client.ListImages(ctx)
+	if err != nil || len(imgList) == 0 {
+		t.Fatalf("ListImages failed: %v", err)
 	}
 }

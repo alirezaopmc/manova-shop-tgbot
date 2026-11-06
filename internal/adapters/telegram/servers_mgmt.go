@@ -20,16 +20,15 @@ func (s *Service) sendUserServersList(ctx context.Context, chatID telego.ChatID,
 	}
 
 	if len(resources) == 0 {
-		text := "🖥️ <b>سرورهای فعال شما</b>\n\n" +
-			"شما در حال حاضر هیچ سرور ابری فعالی در حساب کاربری خود ندارید.\n\n" +
-			"جهت انتخاب پلن و راه‌اندازی فوری سرور از دکمه زیر استفاده نمایید:"
+		text := "🖥️ <b>سرورهای فعال</b>\n\n" +
+			"شما هیچ سرور فعالی ندارید."
 
 		markup := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("🛒 خرید سرور ابری Hetzner").WithCallbackData("menu:catalog"),
+				tu.InlineKeyboardButton("🛒 خرید سرور ابری").WithCallbackData("menu:catalog"),
 			),
 			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("« بازگشت به منوی اصلی").WithCallbackData("menu:main"),
+				tu.InlineKeyboardButton("« منوی اصلی").WithCallbackData("menu:main"),
 			),
 		)
 
@@ -37,11 +36,7 @@ func (s *Service) sendUserServersList(ctx context.Context, chatID telego.ChatID,
 		return err
 	}
 
-	text := fmt.Sprintf(
-		"🖥️ <b>سرورهای فعال شما (%d سرور)</b>\n\n"+
-			"برای مشاهده اطلاعات اتصال، دریافت رمز یا انجام عملیات روی هر سرور، آن را از لیست زیر انتخاب کنید:",
-		len(resources),
-	)
+	text := fmt.Sprintf("🖥️ <b>سرورهای فعال (%d)</b>\n\nسرور مورد نظر را انتخاب نمایید:", len(resources))
 
 	var rows [][]telego.InlineKeyboardButton
 	for _, res := range resources {
@@ -57,7 +52,7 @@ func (s *Service) sendUserServersList(ctx context.Context, chatID telego.ChatID,
 
 	rows = append(rows, tu.InlineKeyboardRow(
 		tu.InlineKeyboardButton("🛒 خرید سرور جدید").WithCallbackData("menu:catalog"),
-		tu.InlineKeyboardButton("« بازگشت به منوی اصلی").WithCallbackData("menu:main"),
+		tu.InlineKeyboardButton("« منوی اصلی").WithCallbackData("menu:main"),
 	))
 
 	markup := tu.InlineKeyboard(rows...)
@@ -69,7 +64,7 @@ func (s *Service) sendUserServersList(ctx context.Context, chatID telego.ChatID,
 func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.ChatID, resID string, userID int64) error {
 	res, err := s.store.Billing().GetResource(ctx, resID)
 	if err != nil || res == nil || res.Status != billing.ResourceStatusActive {
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ سرور مورد نظر یافت نشد یا قبلاً حذف گردیده است."))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ سرور مورد نظر یافت نشد."))
 		return s.sendUserServersList(ctx, chatID, userID)
 	}
 
@@ -79,40 +74,33 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 		return s.sendAccessDenied(ctx, chatID)
 	}
 
-	stateLabel := "🟢 روشن (Running)"
+	stateLabel := "🟢 Running"
 	if res.PowerState == billing.PowerStateOff {
-		stateLabel = "🔴 خاموش (Powered Off)"
+		stateLabel = "🔴 Powered Off"
 	}
 
 	var accessInfo string
 	if res.SSHKey != "" {
-		accessInfo = "🛡️ <b>ورود با کلید عمومی SSH</b>"
+		accessInfo = "🛡️ <b>SSH Key</b>"
 	} else if res.RootPassword != "" {
-		accessInfo = fmt.Sprintf("🔑 <b>کلمه عبور Root:</b>\n<code>%s</code>", res.RootPassword)
+		accessInfo = fmt.Sprintf("🔑 <b>Root Password:</b> <code>%s</code>", res.RootPassword)
 	} else {
-		accessInfo = "🔑 <i>کلمه عبور Root تولید شده است. در صورت نیاز از دکمه ریست پسورد استفاده نمایید.</i>"
+		accessInfo = "🔑 <i>Password generated (use Reset Password if needed)</i>"
 	}
 
 	text := fmt.Sprintf(
-		"🖥️ <b>مدیریت سرور %s</b>\n\n"+
-			"• وضعیت کارکرد: <b>%s</b>\n"+
-			"• موقعیت دیتاسنتر: <b>%s</b>\n"+
-			"• سیستم‌عامل: <b>%s</b>\n"+
-			"• زمان ساخت: <code>%s UTC</code>\n\n"+
-			"🌐 <b>آدرس‌های شبکه:</b>\n"+
-			"• آی‌پی (IPv4): <code>%s</code>\n"+
-			"• آی‌پی (IPv6): <code>%s</code>\n\n"+
-			"🔑 <b>احراز هویت:</b>\n"+
-			"• نام کاربری: <code>root</code>\n"+
+		"🖥️ <b>%s</b>\n\n"+
+			"• Status: <b>%s</b>\n"+
+			"• Location: <code>%s</code>\n"+
+			"• Image: <code>%s</code>\n"+
+			"• IPv4: <code>%s</code>\n"+
+			"• IPv6: <code>%s</code>\n"+
 			"%s\n\n"+
-			"📌 <b>دستور اتصال در ترمینال:</b>\n"+
-			"<code>ssh root@%s</code>\n\n"+
-			"عملیات مورد نظر خود را انتخاب نمایید:",
+			"SSH: <code>ssh root@%s</code>",
 		res.ServerName,
 		stateLabel,
-		locationName(res.Location),
-		osImageLabel(res.ImageName),
-		res.CreatedAt.Format("2006-01-02 15:04"),
+		res.Location,
+		res.ImageName,
 		res.IPv4Address,
 		res.IPv6Address,
 		accessInfo,
@@ -124,30 +112,30 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 	// Power controls
 	if res.PowerState == billing.PowerStateOff {
 		rows = append(rows, tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("⚡ روشن کردن سرور").WithCallbackData(fmt.Sprintf("srv:act:poweron:%s", res.ID)),
-			tu.InlineKeyboardButton("🔄 ریبوت سرور").WithCallbackData(fmt.Sprintf("srv:act:reboot:%s", res.ID)),
+			tu.InlineKeyboardButton("⚡ Power On").WithCallbackData(fmt.Sprintf("srv:act:poweron:%s", res.ID)),
+			tu.InlineKeyboardButton("🔄 Reboot").WithCallbackData(fmt.Sprintf("srv:act:reboot:%s", res.ID)),
 		))
 	} else {
 		rows = append(rows, tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🔌 خاموش کردن سرور").WithCallbackData(fmt.Sprintf("srv:act:poweroff:%s", res.ID)),
-			tu.InlineKeyboardButton("🔄 ریبوت سرور").WithCallbackData(fmt.Sprintf("srv:act:reboot:%s", res.ID)),
+			tu.InlineKeyboardButton("🔌 Power Off").WithCallbackData(fmt.Sprintf("srv:act:poweroff:%s", res.ID)),
+			tu.InlineKeyboardButton("🔄 Reboot").WithCallbackData(fmt.Sprintf("srv:act:reboot:%s", res.ID)),
 		))
 	}
 
 	// Password and Rescue
 	rows = append(rows, tu.InlineKeyboardRow(
-		tu.InlineKeyboardButton("🔑 ریست رمز Root").WithCallbackData(fmt.Sprintf("srv:act:reset_pwd:%s", res.ID)),
-		tu.InlineKeyboardButton("🛟 حالت نجات (Rescue)").WithCallbackData(fmt.Sprintf("srv:act:rescue:%s", res.ID)),
+		tu.InlineKeyboardButton("🔑 Reset Root Password").WithCallbackData(fmt.Sprintf("srv:act:reset_pwd:%s", res.ID)),
+		tu.InlineKeyboardButton("🛟 Rescue Mode").WithCallbackData(fmt.Sprintf("srv:act:rescue:%s", res.ID)),
 	))
 
 	// Delete server
 	rows = append(rows, tu.InlineKeyboardRow(
-		tu.InlineKeyboardButton("🗑️ حذف کامل سرور").WithCallbackData(fmt.Sprintf("srv:act:delete_prompt:%s", res.ID)),
+		tu.InlineKeyboardButton("🗑️ Delete Server").WithCallbackData(fmt.Sprintf("srv:act:delete_prompt:%s", res.ID)),
 	))
 
 	// Navigation
 	rows = append(rows, tu.InlineKeyboardRow(
-		tu.InlineKeyboardButton("« بازگشت به لیست سرورها").WithCallbackData("menu:servers"),
+		tu.InlineKeyboardButton("« سرورها").WithCallbackData("menu:servers"),
 		tu.InlineKeyboardButton("🏠 منوی اصلی").WithCallbackData("menu:main"),
 	))
 
@@ -168,7 +156,7 @@ func (s *Service) handleServerPowerOn(ctx context.Context, cb *telego.CallbackQu
 	res.PowerState = billing.PowerStateRunning
 	_ = s.store.Billing().SaveResource(ctx, res)
 
-	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚡ سرور با موفقیت روشن شد."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚡ Power On sent."))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }
 
@@ -184,7 +172,7 @@ func (s *Service) handleServerPowerOff(ctx context.Context, cb *telego.CallbackQ
 	res.PowerState = billing.PowerStateOff
 	_ = s.store.Billing().SaveResource(ctx, res)
 
-	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔌 سرور خاموش شد."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔌 Power Off sent."))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }
 
@@ -200,7 +188,7 @@ func (s *Service) handleServerReboot(ctx context.Context, cb *telego.CallbackQue
 	res.PowerState = billing.PowerStateRunning
 	_ = s.store.Billing().SaveResource(ctx, res)
 
-	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔄 دستور ریبوت به سرور ارسال گردید."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔄 Reboot sent."))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }
 
@@ -214,19 +202,17 @@ func (s *Service) handleServerResetPassword(ctx context.Context, cb *telego.Call
 
 	newPwd, err := s.provider.ResetPassword(ctx, res.ExternalID)
 	if err != nil {
-		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("خطا در بازنشانی رمز عبور."))
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("Error resetting root password."))
 		return nil
 	}
 
 	res.RootPassword = newPwd
 	_ = s.store.Billing().SaveResource(ctx, res)
 
-	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔑 کلمه عبور با موفقیت ریست شد."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔑 Root password reset."))
 
 	notice := fmt.Sprintf(
-		"🔑 <b>کلمه عبور جدید Root برای سرور %s تنظیم شد:</b>\n\n"+
-			"<code>%s</code>\n\n"+
-			"لطفاً این رمز را در جای امن ذخیره فرمایید.",
+		"🔑 <b>New Root Password (%s):</b>\n<code>%s</code>",
 		res.ServerName, newPwd,
 	)
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
@@ -243,16 +229,14 @@ func (s *Service) handleServerRescue(ctx context.Context, cb *telego.CallbackQue
 
 	rescuePwd, err := s.provider.EnableRescue(ctx, res.ExternalID)
 	if err != nil {
-		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("خطا در فعال‌سازی Rescue Mode."))
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("Error enabling rescue mode."))
 		return nil
 	}
 
-	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🛟 حالت نجات فعال گردید."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🛟 Rescue mode enabled."))
 
 	notice := fmt.Sprintf(
-		"🛟 <b>حالت نجات (Rescue Mode) برای سرور %s فعال شد</b>\n\n"+
-			"• رمز عبور موقت محیط نجات:\n<code>%s</code>\n\n"+
-			"⚠️ <i>برای بوت شدن سرور به سیستم نجات لینوکس، هم‌اکنون سرور را ریبوت نمایید.</i>",
+		"🛟 <b>Rescue Mode enabled (%s):</b>\n<code>%s</code>\n\nReboot server to boot into rescue system.",
 		res.ServerName, rescuePwd,
 	)
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
@@ -266,20 +250,17 @@ func (s *Service) handleServerDeletePrompt(ctx context.Context, chatID telego.Ch
 	}
 
 	text := fmt.Sprintf(
-		"⚠️ <b>هشدار: تایید حذف سرور ابری</b>\n\n"+
-			"آیا از حذف کامل سرور <b>%s</b> (%s) اطمینان قطعی دارید؟\n\n"+
-			"• تمامی اطلاعات، فایل‌ها و تنظیمات روی دیسک این سرور برای همیشه پاک خواهند شد.\n"+
-			"• با حذف سرور، محاسبه هزینه آن بلافاصله متوقف می‌شود.\n"+
-			"• این عملیات به هیچ عنوان قابل بازگشت نیست.",
+		"⚠️ <b>Delete Server (%s - %s)</b>\n\n"+
+			"All data will be permanently erased. Billing stops immediately.",
 		res.ServerName, res.IPv4Address,
 	)
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🗑️ بله، سرور را برای همیشه حذف کن").WithCallbackData(fmt.Sprintf("srv:act:delete_confirm:%s", res.ID)),
+			tu.InlineKeyboardButton("🗑️ Confirm Delete").WithCallbackData(fmt.Sprintf("srv:act:delete_confirm:%s", res.ID)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« انصراف و بازگشت به مشخصات سرور").WithCallbackData(fmt.Sprintf("srv:manage:%s", res.ID)),
+			tu.InlineKeyboardButton("« Cancel").WithCallbackData(fmt.Sprintf("srv:manage:%s", res.ID)),
 		),
 	)
 
@@ -298,9 +279,9 @@ func (s *Service) handleServerDeleteConfirm(ctx context.Context, cb *telego.Call
 	_ = s.provider.DeleteServer(ctx, res.ExternalID)
 	_ = s.store.Billing().UpdateResourceBillingEnd(ctx, res.ID, time.Now().UTC(), billing.ResourceStatusDeleted)
 
-	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🗑️ سرور با موفقیت حذف گردید."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🗑️ Server deleted."))
 
-	msg := fmt.Sprintf("✅ <b>سرور %s با موفقیت حذف شد.</b>\n\nمحاسبه هزینه متوقف گردید و باقیمانده اعتبار در کیف پول شما محفوظ است.", res.ServerName)
+	msg := fmt.Sprintf("✅ <b>%s deleted.</b> Billing stopped.", res.ServerName)
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, msg).WithParseMode(telego.ModeHTML))
 
 	return s.sendUserServersList(ctx, chatID, userID)

@@ -643,15 +643,20 @@ func (s *Service) sendMainMenu(ctx context.Context, chatID telego.ChatID, usr *u
 
 func (s *Service) sendAdminPortal(ctx context.Context, chatID telego.ChatID) error {
 	userCount, _ := s.store.Users().Count(ctx)
+	hcloudStatus := "🟢 Connected"
+	if !s.provider.HasToken() {
+		hcloudStatus = "🔴 Missing HCLOUD_TOKEN"
+	}
 	text := fmt.Sprintf(
-		"⚙️ <b>پنل مدیریت فروشگاه مانوا</b>\n\n"+
-			"• کل کاربران ثبت‌نام شده: <code>%d</code>\n"+
-			"• دارنده کارت بانکی: <code>%s</code>\n"+
-			"• مارجین نرخ دلار: <code>%d تومان</code>\n\n"+
-			"یکی از گزینه‌های مدیریتی زیر را انتخاب فرمایید:",
+		"⚙️ <b>پنل مدیریت</b>\n\n"+
+			"• کاربران: <code>%d</code>\n"+
+			"• Hetzner API: <b>%s</b>\n"+
+			"• نام دارنده کارت: <code>%s</code>\n"+
+			"• مارجین دلار: <code>%s تومان</code>",
 		userCount,
+		hcloudStatus,
 		s.cfg.CardHolderName,
-		s.cfg.RateSpreadIRTPerUSD,
+		formatNumber(int64(s.cfg.RateSpreadIRTPerUSD)),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -790,15 +795,10 @@ func (s *Service) sendServerDetail(ctx context.Context, chatID telego.ChatID, it
 	monthlyIRT := pricing.CalculatePriceIRT(it.MonthlyCapUSD, sellRate)
 
 	text := fmt.Sprintf(
-		"🖥️ <b>مشخصات سرور %s</b>\n\n"+
-			"• <b>پردازنده:</b> <code>%d vCPU</code>\n"+
-			"• <b>رم:</b> <code>%d GB RAM</code>\n"+
-			"• <b>دیسک:</b> <code>%d GB NVMe SSD</code>\n"+
-			"• <b>ترافیک:</b> <code>20 TB Included</code>\n\n"+
-			"💰 <b>هزینه مصرف:</b>\n"+
-			"• ساعتی: <code>%s تومان</code> (دقیقه‌ای %s ت)\n"+
-			"• سقف ماهیانه: <code>%s تومان</code>\n\n"+
-			"⚠️ <i>طبق قوانین هتزنر، محاسبه هزینه بر مبنای دقایق وجود سرور است و با خاموش بودن سرور متوقف نمی‌شود.</i>",
+		"🖥️ <b>%s</b>\n\n"+
+			"• <b>Specs:</b> %d vCPU | %d GB RAM | %d GB NVMe | 20 TB Traffic\n"+
+			"• <b>Hourly:</b> %s T/hr (%s T/min)\n"+
+			"• <b>Monthly max:</b> %s T/mo",
 		it.Name, it.VCPU, it.RAMGB, it.DiskGB,
 		formatNumber(int64(hourlyIRT)), formatNumber(int64(hourlyIRT/60)),
 		formatNumber(int64(monthlyIRT)),
@@ -806,10 +806,10 @@ func (s *Service) sendServerDetail(ctx context.Context, chatID telego.ChatID, it
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🚀 خرید و راه‌اندازی این سرور").WithCallbackData(fmt.Sprintf("plan:buy:%s", it.ID)),
+			tu.InlineKeyboardButton("🚀 خرید و راه‌اندازی").WithCallbackData(fmt.Sprintf("plan:buy:%s", it.ID)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« بازگشت به لیست پلن‌ها").WithCallbackData("menu:catalog"),
+			tu.InlineKeyboardButton("« لیست پلن‌ها").WithCallbackData("menu:catalog"),
 		),
 	)
 
