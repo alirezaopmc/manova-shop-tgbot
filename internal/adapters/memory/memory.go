@@ -70,6 +70,24 @@ func NewStore() *Store {
 		marketRate:     270_000, // Seed baseline market rate 270,000 IRT / USD (updated dynamically by fxrate.Poller)
 	}
 
+	// Seed system default unlimited invites for inline sharing and direct onboarding
+	s.invites["invite"] = &invite.Invite{
+		Code:      "invite",
+		CreatedBy: 6246642516,
+		MaxUses:   0,
+		UsesCount: 0,
+		IsActive:  true,
+		CreatedAt: time.Now().UTC(),
+	}
+	s.invites["shop"] = &invite.Invite{
+		Code:      "shop",
+		CreatedBy: 6246642516,
+		MaxUses:   0,
+		UsesCount: 0,
+		IsActive:  true,
+		CreatedAt: time.Now().UTC(),
+	}
+
 	// Seed default Hetzner CX catalog items
 	s.catalogItems["cx23"] = &catalog.Item{
 		ID:             "cx23",

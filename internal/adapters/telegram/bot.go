@@ -155,6 +155,15 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 		return s.sendAccessDenied(ctx, chatID)
 	}
 
+	// Auto-seed unlimited invite if using general/referral code (e.g. "invite", "shop", "inline", or admin ID)
+	if rawCode == "invite" || rawCode == "shop" || rawCode == "inline" || strings.HasPrefix(rawCode, "ref_") || rawCode == fmt.Sprintf("%d", s.cfg.AdminTelegramID) {
+		if _, getErr := s.store.Invites().GetByCode(ctx, rawCode); getErr != nil {
+			autoInv := invite.New(s.cfg.AdminTelegramID, 0, nil, now)
+			autoInv.Code = rawCode
+			_ = s.store.Invites().Create(ctx, autoInv)
+		}
+	}
+
 	// Validate and claim invite
 	inv, err := s.store.Invites().Claim(ctx, rawCode, userID, now)
 	if err != nil {
@@ -171,10 +180,7 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 		return err
 	}
 
-	welcomeText := fmt.Sprintf(
-		"🎉 <b>به فروشگاه مانوا خوش آمدید!</b>\n\n" +
-			"دعوت‌نامه شما با موفقیت تایید شد. هم‌اکنون می‌توانید سرورهای ابری Hetzner را با تحویل آنی و پرداخت ریالی خریداری فرمایید.",
-	)
+	welcomeText := "🎉 <b>به فروشگاه مانوا خوش آمدید!</b>"
 	_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, welcomeText).WithParseMode(telego.ModeHTML))
 
 	return s.sendMainMenu(ctx, chatID, newUser)
@@ -443,28 +449,24 @@ func (s *Service) handleGenerateInvite(ctx context.Context, chatID telego.ChatID
 	}
 
 	cardText := fmt.Sprintf(
-		"🎫 <b>دعوت‌نامه جدید صادر شد!</b>\n\n"+
-			"• <b>کد دعوت:</b> <code>%s</code>\n"+
-			"• <b>تعداد مجاز:</b> <code>%s</code>\n"+
-			"• <b>وضعیت:</b> 🟢 فعال\n\n"+
-			"🔗 <b>لینک ورود مستقیم:</b>\n"+
-			"<blockquote><code>%s</code></blockquote>\n\n"+
-			"💡 <i>می‌توانید با زدن دکمه «ارسال برای دوستان»، این کارت را مستقیماً همراه دکمه ورود برای کاربران بفرستید.</i>",
-		inv.Code,
+		"🎫 <b>دعوت‌نامه فروشگاه مانوا</b>\n\n"+
+			"• <b>ظرفیت:</b> %s\n"+
+			"• <b>لینک ورود مستقیم:</b>\n"+
+			"<code>%s</code>",
 		usesDesc,
 		deepLink,
 	)
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("↗️ ورود به ربات (Join Bot)").WithURL(deepLink),
+			tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("📤 ارسال دعوت اینلاین (Inline)").WithSwitchInlineQuery(""),
+			tu.InlineKeyboardButton("📤 ارسال اینلاین به چت‌ها").WithSwitchInlineQuery(""),
 			tu.InlineKeyboardButton("↗️ اشتراک سریع").WithURL(shareURL),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« بازگشت به پنل مدیریت").WithCallbackData("admin:home"),
+			tu.InlineKeyboardButton("« بازگشت").WithCallbackData("admin:home"),
 		),
 	)
 
@@ -681,21 +683,20 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 
 	deepLink := fmt.Sprintf("https://t.me/%s?start=invite", botUser)
 
-	text := "🚀 <b>دعوت به ربات سرورهای ابری مانوا (Hetzner Cloud)</b>\n\n" +
-		"خرید سرورهای ابری Hetzner با تحویل آنی، ترافیک ۲۰ ترابایت رایگان، پردازنده‌های پرسرعت AMD/Intel و هارد NVMe.\n\n" +
-		"جهت پیوستن به ربات و ثبت سفارش، روی دکمه زیر کلیک فرمایید:"
+	text := "🛍️ <b>فروشگاه مانوا | Manova Shop</b>\n\n" +
+		"خرید سرورهای ابری Hetzner Cloud با تحویل آنی"
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("↗️ ورود به ربات (Join Bot)").WithURL(deepLink),
+			tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink),
 		),
 	)
 
 	article := (&telego.InlineQueryResultArticle{
 		Type:        "article",
 		ID:          "invite_card",
-		Title:       "🎟️ کارت دعوت به مانوا کلاد (Hetzner Cloud)",
-		Description: "ارسال دعوت‌نامه همراه با دکمه ورود مستقیم به ربات",
+		Title:       "🛍️ فروشگاه مانوا (Manova Shop)",
+		Description: "کارت دعوت به فروشگاه مانوا",
 		InputMessageContent: (&telego.InputTextMessageContent{
 			MessageText: text,
 			ParseMode:   telego.ModeHTML,

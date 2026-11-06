@@ -82,6 +82,8 @@ func TestCleanCode(t *testing.T) {
 		{"invite_XYZ789", "xyz789"},
 		{"  FOOBAR  ", "foobar"},
 		{"/start 1234abcd", "1234abcd"},
+		{"/start ref_6246642516", "6246642516"},
+		{"/start invite", "invite"},
 	}
 
 	for _, c := range cases {

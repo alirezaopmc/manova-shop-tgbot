@@ -90,6 +90,10 @@ func CleanCode(raw string) string {
 	s := strings.TrimSpace(raw)
 	s = strings.TrimPrefix(s, "/start")
 	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "invite_")
+	if strings.HasPrefix(s, "invite_") {
+		s = strings.TrimPrefix(s, "invite_")
+	} else if strings.HasPrefix(s, "ref_") {
+		s = strings.TrimPrefix(s, "ref_")
+	}
 	return strings.ToLower(strings.TrimSpace(s))
 }
