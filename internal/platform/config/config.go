@@ -81,7 +81,10 @@ func (c *Config) DatabaseDSN() string {
 }
 
 // LoadFromEnv loads configuration from environment variables with sensible defaults.
+// It automatically attempts to load key-values from .env files if present.
 func LoadFromEnv() (*Config, error) {
+	loadDotEnvFiles(".env", "/etc/manova/shop-tgbot/shopbot.env")
+
 	cfg := &Config{
 		TelegramBotToken:      secrets.New(os.Getenv("TELEGRAM_BOT_TOKEN")),
 		HCloudToken:           secrets.New(os.Getenv("HCLOUD_TOKEN")),
@@ -231,4 +234,37 @@ func (c *Config) ReconcileIntervalDuration() time.Duration {
 
 func (c *Config) RateMaxAgeDuration() time.Duration {
 	return time.Duration(c.RateMaxAgeHours) * time.Hour
+}
+
+// loadDotEnvFiles reads KEY=VALUE pairs from files if they exist and sets them into the environment.
+func loadDotEnvFiles(paths ...string) {
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			k := strings.TrimSpace(parts[0])
+			v := strings.TrimSpace(parts[1])
+			// Strip surrounding quotes
+			if (strings.HasPrefix(v, "\"") && strings.HasSuffix(v, "\"")) ||
+				(strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'")) {
+				if len(v) >= 2 {
+					v = v[1 : len(v)-1]
+				}
+			}
+			if os.Getenv(k) == "" && v != "" {
+				_ = os.Setenv(k, v)
+			}
+		}
+	}
 }
