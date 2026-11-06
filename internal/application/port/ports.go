@@ -6,11 +6,13 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/refund"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
 )
 
@@ -63,6 +65,22 @@ type TotpVerifier interface {
 type Notifier interface {
 	SendUserMessage(ctx context.Context, telegramUserID int64, text string) error
 	SendAdminAlert(ctx context.Context, text string) error
+}
+
+// UserRepository handles user entity persistence.
+type UserRepository interface {
+	GetByID(ctx context.Context, userID int64) (*user.User, error)
+	FindByPhoneHash(ctx context.Context, phoneHash string) (*user.User, error)
+	Save(ctx context.Context, u *user.User) error
+	Count(ctx context.Context) (int64, error)
+}
+
+// InviteRepository handles onboarding tokens.
+type InviteRepository interface {
+	Create(ctx context.Context, inv *invite.Invite) error
+	GetByCode(ctx context.Context, code string) (*invite.Invite, error)
+	Claim(ctx context.Context, code string, userID int64, now time.Time) (*invite.Invite, error)
+	ListByCreator(ctx context.Context, adminID int64) ([]invite.Invite, error)
 }
 
 // OrderRepository handles order persistence.
