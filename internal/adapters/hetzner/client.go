@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +26,19 @@ const defaultBaseURL = "https://api.hetzner.cloud/v1"
 var (
 	ErrServerNotFound   = errors.New("hetzner server not found")
 	ErrProviderAPIError = errors.New("hetzner api returned an error")
+	ErrMissingToken     = errors.New("Hetzner Cloud API token is not configured (HCLOUD_TOKEN is empty). Please set HCLOUD_TOKEN in /etc/manova/shop-tgbot/shopbot.env")
 )
+
+type resourceCache struct {
+	serverTypes   []port.ProviderServerType
+	serverTypesAt time.Time
+
+	locations   []port.ProviderLocation
+	locationsAt time.Time
+
+	images   []port.ProviderImage
+	imagesAt time.Time
+}
 
 type simulatedServer struct {
 	ID           string
@@ -43,24 +56,27 @@ type simulatedServer struct {
 }
 
 // Client implements port.CloudProvider against Hetzner Cloud API,
-// with automatic high-fidelity in-memory simulation when no token is configured.
+// with 1-minute caching for catalog resources and strict production validation.
 type Client struct {
-	token      string
-	baseURL    string
-	httpClient *http.Client
-	logger     *slog.Logger
+	token          string
+	baseURL        string
+	httpClient     *http.Client
+	logger         *slog.Logger
+	simulationMode bool
 
 	mu        sync.RWMutex
+	cache     resourceCache
 	simulated map[string]*simulatedServer
 	idGen     atomic.Int64
 }
 
 // Config holds settings for Hetzner Cloud client.
 type Config struct {
-	Token      string
-	BaseURL    string
-	HTTPClient *http.Client
-	Logger     *slog.Logger
+	Token          string
+	BaseURL        string
+	HTTPClient     *http.Client
+	Logger         *slog.Logger
+	SimulationMode bool // Only enabled in unit tests
 }
 
 // NewClient returns a new CloudProvider client.
@@ -79,24 +95,319 @@ func NewClient(cfg Config) *Client {
 	}
 
 	c := &Client{
-		token:      cfg.Token,
-		baseURL:    baseURL,
-		httpClient: httpClient,
-		logger:     logger,
-		simulated:  make(map[string]*simulatedServer),
+		token:          cfg.Token,
+		baseURL:        baseURL,
+		httpClient:     httpClient,
+		logger:         logger,
+		simulationMode: cfg.SimulationMode,
+		simulated:      make(map[string]*simulatedServer),
 	}
 	c.idGen.Store(100000)
 	return c
 }
 
 func (c *Client) isSimulated() bool {
-	return c.token == "" || c.token == "simulated"
+	return c.simulationMode
 }
 
-// CreateServer creates a server in Hetzner Cloud or in high-fidelity simulator.
+// HasToken checks if API token is configured or running in simulation mode.
+func (c *Client) HasToken() bool {
+	return c.simulationMode || c.token != ""
+}
+
+// ListServerTypes returns available server types with a 1-minute cache.
+func (c *Client) ListServerTypes(ctx context.Context) ([]port.ProviderServerType, error) {
+	c.mu.RLock()
+	if len(c.cache.serverTypes) > 0 && time.Since(c.cache.serverTypesAt) < 1*time.Minute {
+		cached := append([]port.ProviderServerType(nil), c.cache.serverTypes...)
+		c.mu.RUnlock()
+		return cached, nil
+	}
+	c.mu.RUnlock()
+
+	// If token present, fetch live from Hetzner API
+	if c.token != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/server_types", nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+			resp, err := c.httpClient.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var res struct {
+						ServerTypes []struct {
+							Name        string  `json:"name"`
+							Description string  `json:"description"`
+							Cores       int     `json:"cores"`
+							Memory      float64 `json:"memory"`
+							Disk        int     `json:"disk"`
+						} `json:"server_types"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.ServerTypes) > 0 {
+						var out []port.ProviderServerType
+						for _, st := range res.ServerTypes {
+							out = append(out, port.ProviderServerType{
+								Name:        st.Name,
+								Description: st.Description,
+								Cores:       st.Cores,
+								Memory:      int(st.Memory),
+								Disk:        st.Disk,
+							})
+						}
+						c.mu.Lock()
+						c.cache.serverTypes = out
+						c.cache.serverTypesAt = time.Now().UTC()
+						c.mu.Unlock()
+						return out, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Default baseline fallback
+	defaults := []port.ProviderServerType{
+		{Name: "cx23", Description: "CX23", Cores: 2, Memory: 4, Disk: 40},
+		{Name: "cx33", Description: "CX33", Cores: 4, Memory: 8, Disk: 80},
+		{Name: "cx43", Description: "CX43", Cores: 8, Memory: 16, Disk: 160},
+	}
+	c.mu.Lock()
+	c.cache.serverTypes = defaults
+	c.cache.serverTypesAt = time.Now().UTC()
+	c.mu.Unlock()
+	return defaults, nil
+}
+
+// ListLocations returns available datacenter locations with a 1-minute cache.
+func (c *Client) ListLocations(ctx context.Context) ([]port.ProviderLocation, error) {
+	c.mu.RLock()
+	if len(c.cache.locations) > 0 && time.Since(c.cache.locationsAt) < 1*time.Minute {
+		cached := append([]port.ProviderLocation(nil), c.cache.locations...)
+		c.mu.RUnlock()
+		return cached, nil
+	}
+	c.mu.RUnlock()
+
+	if c.token != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/locations", nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+			resp, err := c.httpClient.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var res struct {
+						Locations []struct {
+							Name        string `json:"name"`
+							Description string `json:"description"`
+							City        string `json:"city"`
+							Country     string `json:"country"`
+						} `json:"locations"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.Locations) > 0 {
+						var out []port.ProviderLocation
+						for _, loc := range res.Locations {
+							out = append(out, port.ProviderLocation{
+								Name:        loc.Name,
+								Description: loc.Description,
+								City:        loc.City,
+								Country:     loc.Country,
+							})
+						}
+						c.mu.Lock()
+						c.cache.locations = out
+						c.cache.locationsAt = time.Now().UTC()
+						c.mu.Unlock()
+						return out, nil
+					}
+				}
+			}
+		}
+	}
+
+	defaults := []port.ProviderLocation{
+		{Name: "nbg1", Description: "Nuremberg", City: "Nuremberg", Country: "DE"},
+		{Name: "fsn1", Description: "Falkenstein", City: "Falkenstein", Country: "DE"},
+		{Name: "hel1", Description: "Helsinki", City: "Helsinki", Country: "FI"},
+	}
+	c.mu.Lock()
+	c.cache.locations = defaults
+	c.cache.locationsAt = time.Now().UTC()
+	c.mu.Unlock()
+	return defaults, nil
+}
+
+// ListImages returns available system images with a 1-minute cache.
+func (c *Client) ListImages(ctx context.Context) ([]port.ProviderImage, error) {
+	c.mu.RLock()
+	if len(c.cache.images) > 0 && time.Since(c.cache.imagesAt) < 1*time.Minute {
+		cached := append([]port.ProviderImage(nil), c.cache.images...)
+		c.mu.RUnlock()
+		return cached, nil
+	}
+	c.mu.RUnlock()
+
+	if c.token != "" {
+		url := c.baseURL + "/images?type=system&architecture=x86"
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+			resp, err := c.httpClient.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var res struct {
+						Images []struct {
+							Name        string `json:"name"`
+							Description string `json:"description"`
+							OSFlavor    string `json:"os_flavor"`
+							OSVersion   string `json:"os_version"`
+							Status      string `json:"status"`
+						} `json:"images"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.Images) > 0 {
+						var out []port.ProviderImage
+						for _, img := range res.Images {
+							if img.Status == "available" && (img.OSFlavor == "ubuntu" || img.OSFlavor == "debian") {
+								out = append(out, port.ProviderImage{
+									Name:        img.Name,
+									Description: img.Description,
+									OSFlavor:    img.OSFlavor,
+									OSVersion:   img.OSVersion,
+								})
+							}
+						}
+						if len(out) > 0 {
+							c.mu.Lock()
+							c.cache.images = out
+							c.cache.imagesAt = time.Now().UTC()
+							c.mu.Unlock()
+							return out, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	defaults := []port.ProviderImage{
+		{Name: "ubuntu-24.04", Description: "Ubuntu 24.04 LTS", OSFlavor: "ubuntu", OSVersion: "24.04"},
+		{Name: "ubuntu-22.04", Description: "Ubuntu 22.04 LTS", OSFlavor: "ubuntu", OSVersion: "22.04"},
+		{Name: "debian-12", Description: "Debian 12", OSFlavor: "debian", OSVersion: "12"},
+		{Name: "debian-11", Description: "Debian 11", OSFlavor: "debian", OSVersion: "11"},
+	}
+	c.mu.Lock()
+	c.cache.images = defaults
+	c.cache.imagesAt = time.Now().UTC()
+	c.mu.Unlock()
+	return defaults, nil
+}
+
+// EnsureSSHKey ensures public key is registered in Hetzner Cloud and returns its key name or ID.
+func (c *Client) EnsureSSHKey(ctx context.Context, name string, publicKey string) (string, error) {
+	if c.isSimulated() {
+		return name, nil
+	}
+	if c.token == "" {
+		return "", ErrMissingToken
+	}
+
+	cleanKey := strings.TrimSpace(publicKey)
+	payload := map[string]string{
+		"name":       name,
+		"public_key": cleanKey,
+	}
+	data, _ := json.Marshal(payload)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/ssh_keys", bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusCreated {
+		var res struct {
+			SSHKey struct {
+				ID   int64  `json:"id"`
+				Name string `json:"name"`
+			} `json:"ssh_key"`
+		}
+		if err := json.Unmarshal(bodyBytes, &res); err == nil && res.SSHKey.Name != "" {
+			return res.SSHKey.Name, nil
+		}
+		return name, nil
+	}
+
+	// If already registered with uniqueness error, find existing key
+	var errResp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(bodyBytes, &errResp)
+	if errResp.Error.Code == "uniqueness_error" {
+		listReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/ssh_keys", nil)
+		if err == nil {
+			listReq.Header.Set("Authorization", "Bearer "+c.token)
+			if listResp, err := c.httpClient.Do(listReq); err == nil {
+				defer listResp.Body.Close()
+				var listRes struct {
+					SSHKeys []struct {
+						ID        int64  `json:"id"`
+						Name      string `json:"name"`
+						PublicKey string `json:"public_key"`
+					} `json:"ssh_keys"`
+				}
+				if err := json.NewDecoder(listResp.Body).Decode(&listRes); err == nil {
+					for _, k := range listRes.SSHKeys {
+						if strings.TrimSpace(k.PublicKey) == cleanKey || k.Name == name {
+							return k.Name, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("Hetzner SSH key error (%s): %s", errResp.Error.Code, errResp.Error.Message)
+	}
+	return name, nil
+}
+
+// CreateServer creates a server in Hetzner Cloud.
 func (c *Client) CreateServer(ctx context.Context, name string, serverType string, imageName string, location string, sshKeyIDs []string) (*port.ProviderCreateResult, error) {
 	if c.isSimulated() {
 		return c.createSimulatedServer(name, serverType, imageName, location, len(sshKeyIDs) > 0)
+	}
+
+	if c.token == "" {
+		return nil, ErrMissingToken
+	}
+
+	// Prepare SSH keys: if any key is raw OpenSSH key, ensure it is registered on Hetzner
+	var hetznerSSHKeys []string
+	for i, k := range sshKeyIDs {
+		trimmed := strings.TrimSpace(k)
+		if strings.HasPrefix(trimmed, "ssh-") || strings.HasPrefix(trimmed, "ecdsa-") {
+			keyName := fmt.Sprintf("%s-key-%d", name, i+1)
+			realKeyName, err := c.EnsureSSHKey(ctx, keyName, trimmed)
+			if err != nil {
+				return nil, fmt.Errorf("failed to register SSH key on Hetzner: %w", err)
+			}
+			hetznerSSHKeys = append(hetznerSSHKeys, realKeyName)
+		} else {
+			hetznerSSHKeys = append(hetznerSSHKeys, trimmed)
+		}
 	}
 
 	reqBody := map[string]any{
@@ -106,8 +417,8 @@ func (c *Client) CreateServer(ctx context.Context, name string, serverType strin
 		"location":           location,
 		"start_after_create": true,
 	}
-	if len(sshKeyIDs) > 0 {
-		reqBody["ssh_keys"] = sshKeyIDs
+	if len(hetznerSSHKeys) > 0 {
+		reqBody["ssh_keys"] = hetznerSSHKeys
 	}
 
 	data, err := json.Marshal(reqBody)
@@ -124,15 +435,23 @@ func (c *Client) CreateServer(ctx context.Context, name string, serverType strin
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.logger.Warn("live hetzner server creation failed, falling back to simulator", "error", err)
-		return c.createSimulatedServer(name, serverType, imageName, location, len(sshKeyIDs) > 0)
+		return nil, fmt.Errorf("failed to connect to Hetzner API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		c.logger.Warn("live hetzner returned non-2xx status, falling back to simulator", "status", resp.StatusCode, "body", string(bodyBytes))
-		return c.createSimulatedServer(name, serverType, imageName, location, len(sshKeyIDs) > 0)
+		var errResp struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(bodyBytes, &errResp)
+		if errResp.Error.Message != "" {
+			return nil, fmt.Errorf("Hetzner API error (%s): %s", errResp.Error.Code, errResp.Error.Message)
+		}
+		return nil, fmt.Errorf("Hetzner API HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var res struct {
@@ -155,15 +474,32 @@ func (c *Client) CreateServer(ctx context.Context, name string, serverType strin
 	}
 
 	if err := json.Unmarshal(bodyBytes, &res); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse Hetzner response: %w", err)
+	}
+
+	ipv4 := res.Server.PublicNet.IPv4.IP
+	ipv6 := res.Server.PublicNet.IPv6.IP
+	extID := strconv.FormatInt(res.Server.ID, 10)
+
+	// If IPv4 is not immediately populated, poll for up to 5 seconds
+	if ipv4 == "" {
+		for poll := 0; poll < 5; poll++ {
+			time.Sleep(1 * time.Second)
+			status, err := c.GetServer(ctx, extID)
+			if err == nil && status.IPv4Address != "" {
+				ipv4 = status.IPv4Address
+				ipv6 = status.IPv6Address
+				break
+			}
+		}
 	}
 
 	return &port.ProviderCreateResult{
-		ExternalID:   strconv.FormatInt(res.Server.ID, 10),
+		ExternalID:   extID,
 		ActionID:     res.Action.ID,
 		RootPassword: res.RootPassword,
-		IPv4Address:  res.Server.PublicNet.IPv4.IP,
-		IPv6Address:  res.Server.PublicNet.IPv6.IP,
+		IPv4Address:  ipv4,
+		IPv6Address:  ipv6,
 		Status:       res.Server.Status,
 	}, nil
 }
@@ -174,6 +510,10 @@ func (c *Client) GetServer(ctx context.Context, externalID string) (*port.Provid
 		return c.getSimulatedServer(externalID)
 	}
 
+	if c.token == "" {
+		return nil, ErrMissingToken
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/servers/%s", c.baseURL, externalID), nil)
 	if err != nil {
 		return nil, err
@@ -182,7 +522,7 @@ func (c *Client) GetServer(ctx context.Context, externalID string) (*port.Provid
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return c.getSimulatedServer(externalID)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -190,7 +530,7 @@ func (c *Client) GetServer(ctx context.Context, externalID string) (*port.Provid
 		return nil, ErrServerNotFound
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return c.getSimulatedServer(externalID)
+		return nil, fmt.Errorf("%w: status %d", ErrProviderAPIError, resp.StatusCode)
 	}
 
 	var res struct {
@@ -237,6 +577,10 @@ func (c *Client) DeleteServer(ctx context.Context, externalID string) error {
 		return nil
 	}
 
+	if c.token == "" {
+		return ErrMissingToken
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s/servers/%s", c.baseURL, externalID), nil)
 	if err != nil {
 		return err
@@ -245,9 +589,14 @@ func (c *Client) DeleteServer(ctx context.Context, externalID string) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotFound {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Hetzner delete server error (%d): %s", resp.StatusCode, string(bodyBytes))
+	}
 	return nil
 }
 
@@ -315,15 +664,14 @@ func (c *Client) ResetPassword(ctx context.Context, externalID string) (string, 
 
 	body, err := c.postActionWithResponse(ctx, externalID, "reset_password", nil)
 	if err != nil {
-		pwd := generateRandomPassword(18)
-		return pwd, nil
+		return "", err
 	}
 	var res struct {
 		RootPassword string `json:"root_password"`
 	}
 	_ = json.Unmarshal(body, &res)
 	if res.RootPassword == "" {
-		return generateRandomPassword(18), nil
+		return "", errors.New("empty password returned by Hetzner reset_password")
 	}
 	return res.RootPassword, nil
 }
@@ -343,14 +691,14 @@ func (c *Client) EnableRescue(ctx context.Context, externalID string) (string, e
 	payload := map[string]string{"type": "linux64"}
 	body, err := c.postActionWithResponse(ctx, externalID, "enable_rescue", payload)
 	if err != nil {
-		return generateRandomPassword(18), nil
+		return "", err
 	}
 	var res struct {
 		RootPassword string `json:"root_password"`
 	}
 	_ = json.Unmarshal(body, &res)
 	if res.RootPassword == "" {
-		return generateRandomPassword(18), nil
+		return "", errors.New("empty password returned by Hetzner enable_rescue")
 	}
 	return res.RootPassword, nil
 }
@@ -374,6 +722,10 @@ func (c *Client) postAction(ctx context.Context, externalID, action string, payl
 }
 
 func (c *Client) postActionWithResponse(ctx context.Context, externalID, action string, payload any) ([]byte, error) {
+	if c.token == "" {
+		return nil, ErrMissingToken
+	}
+
 	url := fmt.Sprintf("%s/servers/%s/actions/%s", c.baseURL, externalID, action)
 	var bodyReader io.Reader
 	if payload != nil {
@@ -398,12 +750,22 @@ func (c *Client) postActionWithResponse(ctx context.Context, externalID, action 
 
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var errResp struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(data, &errResp)
+		if errResp.Error.Message != "" {
+			return nil, fmt.Errorf("Hetzner action error (%s): %s", errResp.Error.Code, errResp.Error.Message)
+		}
 		return nil, fmt.Errorf("%w: status %d", ErrProviderAPIError, resp.StatusCode)
 	}
 	return data, nil
 }
 
-// Simulated helpers
+// Simulated helpers (used ONLY when SimulationMode: true in unit tests)
 func (c *Client) createSimulatedServer(name, serverType, imageName, location string, hasSSHKey bool) (*port.ProviderCreateResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -459,7 +821,6 @@ func (c *Client) getSimulatedServer(externalID string) (*port.ProviderServerStat
 
 	s, ok := c.simulated[externalID]
 	if !ok {
-		// synthesize realistic status if not found
 		return &port.ProviderServerStatus{
 			ExternalID:  externalID,
 			Status:      "running",

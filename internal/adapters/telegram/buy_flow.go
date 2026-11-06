@@ -60,11 +60,11 @@ func (s *Service) clearBuyDraft(userID int64) {
 func validateSSHPublicKey(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return "", errors.New("کلید SSH خالی است")
+		return "", errors.New("empty SSH key")
 	}
 	_, _, _, _, err := ssh.ParseAuthorizedKey([]byte(trimmed))
 	if err != nil {
-		return "", fmt.Errorf("فرمت کلید عمومی OpenSSH نامعتبر است: %w", err)
+		return "", fmt.Errorf("invalid OpenSSH public key format: %w", err)
 	}
 	return trimmed, nil
 }
@@ -72,11 +72,11 @@ func validateSSHPublicKey(raw string) (string, error) {
 func locationName(code string) string {
 	switch code {
 	case "nbg1":
-		return "🇩🇪 نورنبرگ، آلمان (nbg1)"
+		return "nbg1 (Nuremberg, DE)"
 	case "fsn1":
-		return "🇩🇪 فالکن‌اشتاین، آلمان (fsn1)"
+		return "fsn1 (Falkenstein, DE)"
 	case "hel1":
-		return "🇫🇮 هلسینکی، فنلاند (hel1)"
+		return "hel1 (Helsinki, FI)"
 	default:
 		return code
 	}
@@ -89,15 +89,15 @@ func osImageLabel(image string) string {
 	case "ubuntu-22.04":
 		return "Ubuntu 22.04 LTS"
 	case "debian-12":
-		return "Debian 12 (Bookworm)"
+		return "Debian 12"
 	case "debian-11":
-		return "Debian 11 (Bullseye)"
+		return "Debian 11"
 	default:
 		return image
 	}
 }
 
-// Step 1: Location selection
+// Step 1: Location selection (1-minute dynamic cache from Hetzner)
 func (s *Service) sendBuyStep1Location(ctx context.Context, chatID telego.ChatID, userID int64, itemID string) error {
 	it, err := s.store.Catalog().GetItem(ctx, itemID)
 	if err != nil {
@@ -111,28 +111,34 @@ func (s *Service) sendBuyStep1Location(ctx context.Context, chatID telego.ChatID
 	s.setBuyDraft(userID, draft)
 
 	text := fmt.Sprintf(
-		"🌍 <b>مرحله ۱ از ۳: انتخاب موقعیت دیتاسنتر</b>\n\n"+
-			"• سرور انتخابی: <b>%s</b> (%d vCPU, %d GB RAM)\n\n"+
-			"لطفاً لوکیشن دیتاسنتر مورد نظر خود در اروپا را انتخاب کنید:",
+		"🌍 <b>Location (Datacenter)</b>\n\n"+
+			"• Plan: <b>%s</b> (%d vCPU, %d GB RAM)\n"+
+			"Select datacenter location:",
 		it.Name, it.VCPU, it.RAMGB,
 	)
 
-	markup := tu.InlineKeyboard(
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🇩🇪 نورنبرگ، آلمان (Nuremberg - nbg1)").WithCallbackData(fmt.Sprintf("buy:loc:%s:nbg1", itemID)),
-		),
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🇩🇪 فالکن‌اشتاین، آلمان (Falkenstein - fsn1)").WithCallbackData(fmt.Sprintf("buy:loc:%s:fsn1", itemID)),
-		),
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🇫🇮 هلسینکی، فنلاند (Helsinki - hel1)").WithCallbackData(fmt.Sprintf("buy:loc:%s:hel1", itemID)),
-		),
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« بازگشت به مشخصات سرور").WithCallbackData(fmt.Sprintf("plan:view:%s", itemID)),
-			tu.InlineKeyboardButton("❌ انصراف").WithCallbackData("buy:cancel"),
-		),
-	)
+	locations, _ := s.provider.ListLocations(ctx)
+	var rows [][]telego.InlineKeyboardButton
+	for _, loc := range locations {
+		label := fmt.Sprintf("%s (%s, %s)", loc.Name, loc.City, loc.Country)
+		rows = append(rows, tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton(label).WithCallbackData(fmt.Sprintf("buy:loc:%s:%s", itemID, loc.Name)),
+		))
+	}
+	if len(rows) == 0 {
+		rows = append(rows,
+			tu.InlineKeyboardRow(tu.InlineKeyboardButton("nbg1 (Nuremberg, DE)").WithCallbackData(fmt.Sprintf("buy:loc:%s:nbg1", itemID))),
+			tu.InlineKeyboardRow(tu.InlineKeyboardButton("fsn1 (Falkenstein, DE)").WithCallbackData(fmt.Sprintf("buy:loc:%s:fsn1", itemID))),
+			tu.InlineKeyboardRow(tu.InlineKeyboardButton("hel1 (Helsinki, FI)").WithCallbackData(fmt.Sprintf("buy:loc:%s:hel1", itemID))),
+		)
+	}
 
+	rows = append(rows, tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("« Back").WithCallbackData(fmt.Sprintf("plan:view:%s", itemID)),
+		tu.InlineKeyboardButton("❌ Cancel").WithCallbackData("buy:cancel"),
+	))
+
+	markup := tu.InlineKeyboard(rows...)
 	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
@@ -153,21 +159,20 @@ func (s *Service) sendBuyStep2Distro(ctx context.Context, chatID telego.ChatID, 
 	}
 
 	text := fmt.Sprintf(
-		"💿 <b>مرحله ۲ از ۳: انتخاب سیستم‌عامل سرور</b>\n\n"+
-			"• سرور: <b>%s</b>\n"+
-			"• دیتاسنتر: <b>%s</b>\n\n"+
-			"لطفاً توزیع لینوکس مورد نظر خود را انتخاب نمایید:",
+		"💿 <b>Operating System</b>\n\n"+
+			"• Plan: <b>%s</b> | Location: <b>%s</b>\n"+
+			"Select distribution:",
 		name, locationName(location),
 	)
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🐧 اوبونتو (Ubuntu)").WithCallbackData(fmt.Sprintf("buy:os_d:%s:%s:ubuntu", itemID, location)),
-			tu.InlineKeyboardButton("🔴 دبیان (Debian)").WithCallbackData(fmt.Sprintf("buy:os_d:%s:%s:debian", itemID, location)),
+			tu.InlineKeyboardButton("Ubuntu").WithCallbackData(fmt.Sprintf("buy:os_d:%s:%s:ubuntu", itemID, location)),
+			tu.InlineKeyboardButton("Debian").WithCallbackData(fmt.Sprintf("buy:os_d:%s:%s:debian", itemID, location)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« بازگشت به انتخاب لوکیشن").WithCallbackData(fmt.Sprintf("plan:buy:%s", itemID)),
-			tu.InlineKeyboardButton("❌ انصراف").WithCallbackData("buy:cancel"),
+			tu.InlineKeyboardButton("« Back").WithCallbackData(fmt.Sprintf("plan:buy:%s", itemID)),
+			tu.InlineKeyboardButton("❌ Cancel").WithCallbackData("buy:cancel"),
 		),
 	)
 
@@ -175,7 +180,7 @@ func (s *Service) sendBuyStep2Distro(ctx context.Context, chatID telego.ChatID, 
 	return err
 }
 
-// Step 2b: OS Version selection
+// Step 2b: OS Version selection (1-minute dynamic cache from Hetzner)
 func (s *Service) sendBuyStep2Version(ctx context.Context, chatID telego.ChatID, userID int64, itemID, location, distro string) error {
 	draft := s.getBuyDraft(userID)
 	if draft == nil {
@@ -184,34 +189,42 @@ func (s *Service) sendBuyStep2Version(ctx context.Context, chatID telego.ChatID,
 	draft.Distro = distro
 	s.setBuyDraft(userID, draft)
 
-	var title string
-	var rows [][]telego.InlineKeyboardButton
+	distroTitle := "Ubuntu"
+	if distro == "debian" {
+		distroTitle = "Debian"
+	}
+	title := fmt.Sprintf("💿 <b>%s Version</b>\n\nSelect version:", distroTitle)
 
-	if distro == "ubuntu" {
-		title = "🐧 <b>انتخاب نسخه اوبونتو (Ubuntu)</b>\n\nنسخه مورد نظر را برای نصب روی سرور مشخص فرمایید:"
-		rows = [][]telego.InlineKeyboardButton{
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("Ubuntu 24.04 LTS (جدیدترین نسخه پایدار)").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:ubuntu-24.04", itemID, location, distro)),
-			),
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("Ubuntu 22.04 LTS (پایدار)").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:ubuntu-22.04", itemID, location, distro)),
-			),
+	images, _ := s.provider.ListImages(ctx)
+	var rows [][]telego.InlineKeyboardButton
+	for _, img := range images {
+		if strings.EqualFold(img.OSFlavor, distro) {
+			label := img.Description
+			if label == "" {
+				label = img.Name
+			}
+			rows = append(rows, tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton(label).WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:%s", itemID, location, distro, img.Name)),
+			))
 		}
-	} else {
-		title = "🔴 <b>انتخاب نسخه دبیان (Debian)</b>\n\nنسخه مورد نظر را برای نصب روی سرور مشخص فرمایید:"
-		rows = [][]telego.InlineKeyboardButton{
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("Debian 12 (Bookworm)").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:debian-12", itemID, location, distro)),
-			),
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("Debian 11 (Bullseye)").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:debian-11", itemID, location, distro)),
-			),
+	}
+	if len(rows) == 0 {
+		if distro == "ubuntu" {
+			rows = append(rows,
+				tu.InlineKeyboardRow(tu.InlineKeyboardButton("Ubuntu 24.04 LTS").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:ubuntu-24.04", itemID, location, distro))),
+				tu.InlineKeyboardRow(tu.InlineKeyboardButton("Ubuntu 22.04 LTS").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:ubuntu-22.04", itemID, location, distro))),
+			)
+		} else {
+			rows = append(rows,
+				tu.InlineKeyboardRow(tu.InlineKeyboardButton("Debian 12").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:debian-12", itemID, location, distro))),
+				tu.InlineKeyboardRow(tu.InlineKeyboardButton("Debian 11").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:debian-11", itemID, location, distro))),
+			)
 		}
 	}
 
 	rows = append(rows, tu.InlineKeyboardRow(
-		tu.InlineKeyboardButton("« بازگشت به انتخاب توزیع").WithCallbackData(fmt.Sprintf("buy:loc:%s:%s", itemID, location)),
-		tu.InlineKeyboardButton("❌ انصراف").WithCallbackData("buy:cancel"),
+		tu.InlineKeyboardButton("« Back").WithCallbackData(fmt.Sprintf("buy:loc:%s:%s", itemID, location)),
+		tu.InlineKeyboardButton("❌ Cancel").WithCallbackData("buy:cancel"),
 	))
 
 	markup := tu.InlineKeyboard(rows...)
@@ -236,26 +249,22 @@ func (s *Service) sendBuyStep3Access(ctx context.Context, chatID telego.ChatID, 
 	}
 
 	text := fmt.Sprintf(
-		"🔑 <b>مرحله ۳ از ۳: شیوه دسترسی و احراز هویت</b>\n\n"+
-			"• سرور: <b>%s</b>\n"+
-			"• لوکیشن: <b>%s</b>\n"+
-			"• سیستم‌عامل: <b>%s</b>\n\n"+
-			"لطفاً نحوه دسترسی به حساب root سرور را تعیین نمایید:\n\n"+
-			"• <b>کلمه عبور Root:</b> یک رمز عبور تصادفی و بسیار امن تولید شده و بلافاصله پس از ساخت سرور به شما تحویل داده می‌شود.\n\n"+
-			"• <b>کلید عمومی SSH:</b> ورود بسیار امن بدون نیاز به کلمه عبور با کلید اختصاصی OpenSSH شما.",
+		"🔑 <b>Authentication</b>\n\n"+
+			"• Plan: <b>%s</b> | Location: <b>%s</b> | OS: <b>%s</b>\n\n"+
+			"Select authentication method:",
 		name, locationName(location), osImageLabel(image),
 	)
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🔑 کلمه عبور Root (تولید خودکار و امن)").WithCallbackData(fmt.Sprintf("buy:acc_pwd:%s:%s:%s", itemID, location, image)),
+			tu.InlineKeyboardButton("🔑 Root Password (Auto-generate)").WithCallbackData(fmt.Sprintf("buy:acc_pwd:%s:%s:%s", itemID, location, image)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🛡️ ثبت کلید عمومی SSH (Public Key)").WithCallbackData(fmt.Sprintf("buy:acc_ssh_prompt:%s:%s:%s", itemID, location, image)),
+			tu.InlineKeyboardButton("🛡️ SSH Public Key").WithCallbackData(fmt.Sprintf("buy:acc_ssh_prompt:%s:%s:%s", itemID, location, image)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« بازگشت به انتخاب سیستم‌عامل").WithCallbackData(fmt.Sprintf("buy:os_d:%s:%s:%s", itemID, location, distro)),
-			tu.InlineKeyboardButton("❌ انصراف").WithCallbackData("buy:cancel"),
+			tu.InlineKeyboardButton("« Back").WithCallbackData(fmt.Sprintf("buy:os_d:%s:%s:%s", itemID, location, distro)),
+			tu.InlineKeyboardButton("❌ Cancel").WithCallbackData("buy:cancel"),
 		),
 	)
 
@@ -272,19 +281,17 @@ func (s *Service) sendBuyStep3SSHPrompt(ctx context.Context, chatID telego.ChatI
 	draft.Awaiting = "ssh_key"
 	s.setBuyDraft(userID, draft)
 
-	text := "🛡️ <b>ثبت کلید عمومی SSH (OpenSSH Public Key)</b>\n\n" +
-		"لطفاً کلید عمومی خود را کپی کرده و به عنوان یک پیام در همین چت ارسال نمایید.\n\n" +
-		"نمونه فرمت‌های معتبر:\n" +
-		"<code>ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host</code>\n" +
-		"<code>ssh-rsa AAAAB3NzaC1yc2E... user@host</code>\n\n" +
-		"⚠️ <i>توجه: کلید خصوصی (Private Key) خود را هرگز برای هیچ‌کس ارسال نکنید! فقط کلید عمومی با پیشوند ssh-ed25519 یا ssh-rsa پذیرفته می‌شود.</i>"
+	text := "🛡️ <b>Send SSH Public Key</b>\n\n" +
+		"Paste your OpenSSH public key in this chat:\n" +
+		"<code>ssh-ed25519 AAAAC3... user@host</code>\n" +
+		"<code>ssh-rsa AAAAB3... user@host</code>"
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🔑 انصراف و استفاده از رمز عبور Root").WithCallbackData(fmt.Sprintf("buy:acc_pwd:%s:%s:%s", itemID, location, image)),
+			tu.InlineKeyboardButton("🔑 Use Root Password instead").WithCallbackData(fmt.Sprintf("buy:acc_pwd:%s:%s:%s", itemID, location, image)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("❌ انصراف از خرید").WithCallbackData("buy:cancel"),
+			tu.InlineKeyboardButton("❌ Cancel").WithCallbackData("buy:cancel"),
 		),
 	)
 
@@ -310,34 +317,29 @@ func (s *Service) sendBuyStep4Confirm(ctx context.Context, chatID telego.ChatID,
 
 	var accessDesc string
 	if draft.AccessMode == "ssh" {
-		accessDesc = "🛡️ کلید عمومی SSH (ورود بدون نیاز به پسورد)"
+		accessDesc = "SSH Key"
 	} else {
-		accessDesc = "🔑 کلمه عبور Root (تولید امن پس از ساخت)"
+		accessDesc = "Root Password"
 	}
 
 	balanceSufficient := combinedVal >= initialBlockIRT
 
 	text := fmt.Sprintf(
-		"🧾 <b>پیش‌فاکتور و تایید نهایی سفارش سرور</b>\n\n"+
-			"🖥️ <b>مشخصات فنی سرور:</b>\n"+
-			"• مدل سرور: <b>%s</b> (%d vCPU, %d GB RAM, %d GB NVMe)\n"+
-			"• موقعیت دیتاسنتر: <b>%s</b>\n"+
-			"• سیستم‌عامل انتخابی: <b>%s</b>\n"+
-			"• شیوه احراز هویت: <b>%s</b>\n\n"+
-			"💰 <b>تعرفه و هزینه مصرف:</b>\n"+
-			"• نرخ تبدیل دلار روز: <code>%s تومان</code>\n"+
-			"• هزینه ساعتی: <code>%s تومان</code> (دقیقه‌ای %s ت)\n"+
-			"• سقف هزینه ماهیانه: <code>%s تومان</code>\n"+
-			"• مبلغ پیش‌پرداخت اولیه (ساعت اول): <code>%s تومان</code>\n\n"+
-			"💼 <b>وضعیت کیف پول شما:</b>\n"+
-			"• موجودی قابل استفاده: <code>%s تومان</code>\n\n"+
-			"⚠️ <i>توجه: طبق ساختار تعرفه کلود هتزنر، محاسبه هزینه بر مبنای دقایق وجود سرور بوده و حتی در حالت خاموش تا زمان حذف سرور ادامه دارد.</i>",
+		"🧾 <b>Order Confirmation</b>\n\n"+
+			"• Server: <b>%s</b> (%d vCPU, %d GB RAM, %d GB NVMe)\n"+
+			"• Location: <b>%s</b>\n"+
+			"• OS: <b>%s</b>\n"+
+			"• Auth: <b>%s</b>\n\n"+
+			"💰 <b>Pricing:</b>\n"+
+			"• Hourly: <code>%s Toman</code>\n"+
+			"• Monthly Cap: <code>%s Toman</code>\n"+
+			"• Prepay (1st hour): <code>%s Toman</code>\n\n"+
+			"💼 <b>Wallet Balance:</b> <code>%s Toman</code>",
 		it.Name, it.VCPU, it.RAMGB, it.DiskGB,
 		locationName(draft.Location),
 		osImageLabel(draft.OSImage),
 		accessDesc,
-		formatNumber(int64(sellRate)),
-		formatNumber(int64(hourlyIRT)), formatNumber(int64(hourlyIRT/60)),
+		formatNumber(int64(hourlyIRT)),
 		formatNumber(int64(monthlyIRT)),
 		formatNumber(int64(initialBlockIRT)),
 		formatNumber(int64(combinedVal)),
@@ -347,13 +349,13 @@ func (s *Service) sendBuyStep4Confirm(ctx context.Context, chatID telego.ChatID,
 
 	if balanceSufficient {
 		rows = append(rows, tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🚀 تایید سفارش و ساخت فوری سرور").WithCallbackData(fmt.Sprintf("buy:exec:%s:%s:%s:%s", draft.PlanID, draft.Location, draft.OSImage, draft.AccessMode)),
+			tu.InlineKeyboardButton("🚀 Confirm & Deploy Server").WithCallbackData(fmt.Sprintf("buy:exec:%s:%s:%s:%s", draft.PlanID, draft.Location, draft.OSImage, draft.AccessMode)),
 		))
 	} else {
 		deficit := initialBlockIRT - combinedVal
-		text += fmt.Sprintf("\n\n⛔ <b>موجودی کیف پول شما برای پیش‌پرداخت ساعت اول کافی نیست!</b>\nکسری موجودی: <code>%s تومان</code>\nلطفاً ابتدا کیف پول خود را شارژ فرمایید.", formatNumber(int64(deficit)))
+		text += fmt.Sprintf("\n\n⛔ <b>Insufficient balance.</b> Deficit: <code>%s Toman</code>", formatNumber(int64(deficit)))
 		rows = append(rows, tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("💳 شارژ کیف پول").WithCallbackData("wallet:topup_info"),
+			tu.InlineKeyboardButton("💳 Top Up Wallet").WithCallbackData("wallet:topup_info"),
 		))
 	}
 
@@ -363,8 +365,8 @@ func (s *Service) sendBuyStep4Confirm(ctx context.Context, chatID telego.ChatID,
 	}
 
 	rows = append(rows, tu.InlineKeyboardRow(
-		tu.InlineKeyboardButton("« ویرایش مشخصات دسترسی").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:%s", draft.PlanID, draft.Location, distro, draft.OSImage)),
-		tu.InlineKeyboardButton("❌ انصراف").WithCallbackData("buy:cancel"),
+		tu.InlineKeyboardButton("« Edit").WithCallbackData(fmt.Sprintf("buy:os_v:%s:%s:%s:%s", draft.PlanID, draft.Location, distro, draft.OSImage)),
+		tu.InlineKeyboardButton("❌ Cancel").WithCallbackData("buy:cancel"),
 	))
 
 	markup := tu.InlineKeyboard(rows...)
@@ -379,13 +381,22 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		return s.sendAccessDenied(ctx, chatID)
 	}
 	if usr.Blocked {
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب شما مسدود است: %s", s.cfg.SupportHandle)))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ Your account is blocked: %s", s.cfg.SupportHandle)))
 		return nil
 	}
 
 	it, err := s.store.Catalog().GetItem(ctx, planID)
 	if err != nil {
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ پلن مورد نظر در کاتالوگ یافت نشد."))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ Selected plan was not found in catalog."))
+		return nil
+	}
+
+	// Token configuration check: never silently fake server creation if token is missing
+	if !s.provider.HasToken() {
+		errMsg := "⚠️ <b>Hetzner API token is not configured on this host.</b>\n\n" +
+			"Live server creation cannot proceed until <code>HCLOUD_TOKEN</code> is set in <code>/etc/manova/shop-tgbot/shopbot.env</code>.\n\n" +
+			"Your wallet was not debited."
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, errMsg).WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
@@ -404,12 +415,11 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		if draft != nil {
 			return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
 		}
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ موجودی کیف پول کافی نیست. لطفاً کیف پول را شارژ فرمایید."))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ Insufficient wallet balance."))
 		return nil
 	}
 
-	// Progress indicator
-	waitMsg, _ := s.sendMessage(ctx, tu.Message(chatID, "⏳ <b>در حال کسر پیش‌پرداخت و ارسال دستور ساخت سرور به دیتاسنتر...</b>").WithParseMode(telego.ModeHTML))
+	waitMsg, _ := s.sendMessage(ctx, tu.Message(chatID, "⏳ <b>Deploying server on Hetzner Cloud...</b>").WithParseMode(telego.ModeHTML))
 
 	// 1. Debit initial block from wallet
 	w.BalanceIRT -= initialBlockIRT
@@ -451,13 +461,20 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 
 	createResult, err := s.provider.CreateServer(ctx, serverName, it.HetznerType, osImage, location, sshKeys)
 	if err != nil {
-		// Rollback debit on critical provider failure
+		// Rollback debit on provider failure
 		w.BalanceIRT += initialBlockIRT
 		_ = s.store.Wallets().UpdateBalances(ctx, w)
 		ord.Status = order.StateFulfillmentFailed
 		_ = s.store.Orders().Save(ctx, ord, nil)
 
-		errMsg := fmt.Sprintf("❌ <b>خطا در ساخت سرور!</b>\n\nارتباط با دیتاسنتر با خطا مواجه شد و مبلغ کسر شده به کیف پول شما برگشت داده شد.\nخطا: <code>%v</code>", err)
+		if waitMsg != nil {
+			_ = s.deleteMessage(ctx, &telego.DeleteMessageParams{
+				ChatID:    chatID,
+				MessageID: waitMsg.MessageID,
+			})
+		}
+
+		errMsg := fmt.Sprintf("❌ <b>Hetzner Server Creation Failed</b>\n\n%v\n\nYour wallet balance has been refunded.", err)
 		_, _ = s.sendMessage(ctx, tu.Message(chatID, errMsg).WithParseMode(telego.ModeHTML))
 		return nil
 	}
@@ -488,7 +505,6 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	ord.Status = order.StateDelivered
 	_ = s.store.Orders().Save(ctx, ord, nil)
 
-	// 5. Clear draft
 	s.clearBuyDraft(userID)
 
 	if waitMsg != nil {
@@ -498,30 +514,28 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		})
 	}
 
-	// 6. Deliver Server Card
+	// 5. Deliver Server Card (Minimal & Technical)
 	var credsSection string
 	if accessMode == "ssh" {
-		credsSection = "• شیوه دسترسی: 🛡️ <b>ورود با کلید SSH عمومی ثبت‌شده</b>\n• نام کاربری: <code>root</code>"
+		credsSection = "• Auth: <b>SSH Key</b>\n• Username: <code>root</code>"
 	} else {
-		credsSection = fmt.Sprintf("• نام کاربری: <code>root</code>\n• کلمه عبور Root:\n<code>%s</code>", createResult.RootPassword)
+		credsSection = fmt.Sprintf("• Username: <code>root</code>\n• Root Password:\n<code>%s</code>", createResult.RootPassword)
 	}
 
 	successText := fmt.Sprintf(
-		"🎉 <b>تبریک! سرور ابری شما با موفقیت راه‌اندازی و تحویل داده شد.</b>\n\n"+
-			"🖥️ <b>اطلاعات سرور:</b>\n"+
-			"• نام سرور: <code>%s</code>\n"+
-			"• مدل: <b>%s</b> (%d vCPU, %d GB RAM)\n"+
-			"• موقعیت دیتاسنتر: <b>%s</b>\n"+
-			"• سیستم‌عامل: <b>%s</b>\n\n"+
-			"🌐 <b>آدرس‌های شبکه:</b>\n"+
-			"• آی‌پی اصلی (IPv4):\n<code>%s</code>\n"+
-			"• آی‌پی (IPv6):\n<code>%s</code>\n\n"+
-			"🔑 <b>اطلاعات ورود به سرور:</b>\n"+
+		"🎉 <b>Server Ready</b>\n\n"+
+			"• Name: <code>%s</code>\n"+
+			"• Plan: <b>%s</b>\n"+
+			"• Location: <b>%s</b>\n"+
+			"• OS: <b>%s</b>\n\n"+
+			"🌐 <b>Network:</b>\n"+
+			"• IPv4: <code>%s</code>\n"+
+			"• IPv6: <code>%s</code>\n\n"+
+			"🔑 <b>Login:</b>\n"+
 			"%s\n\n"+
-			"📌 <b>دستور اتصال سریع در ترمینال:</b>\n"+
-			"<code>ssh root@%s</code>\n\n"+
-			"💡 <i>جهت مدیریت، ریبوت، خاموش کردن یا بازنشانی کلمه عبور، به بخش «🖥️ سرورهای من» مراجعه فرمایید.</i>",
-		serverName, it.Name, it.VCPU, it.RAMGB,
+			"📌 <b>Connect:</b>\n"+
+			"<code>ssh root@%s</code>",
+		serverName, it.Name,
 		locationName(location),
 		osImageLabel(osImage),
 		createResult.IPv4Address,
@@ -532,11 +546,11 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🖥️ مدیریت این سرور").WithCallbackData(fmt.Sprintf("srv:manage:%s", res.ID)),
+			tu.InlineKeyboardButton("🖥️ Manage Server").WithCallbackData(fmt.Sprintf("srv:manage:%s", res.ID)),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("📋 لیست سرورهای من").WithCallbackData("menu:servers"),
-			tu.InlineKeyboardButton("🏠 منوی اصلی").WithCallbackData("menu:main"),
+			tu.InlineKeyboardButton("📋 My Servers").WithCallbackData("menu:servers"),
+			tu.InlineKeyboardButton("🏠 Main Menu").WithCallbackData("menu:main"),
 		),
 	)
 

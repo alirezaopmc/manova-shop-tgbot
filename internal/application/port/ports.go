@@ -41,8 +41,34 @@ type ProviderCreateResult struct {
 	Status       string
 }
 
+// ProviderServerType holds specs of an offered cloud server type.
+type ProviderServerType struct {
+	Name        string
+	Description string
+	Cores       int
+	Memory      int
+	Disk        int
+}
+
+// ProviderLocation holds facts of a cloud datacenter location.
+type ProviderLocation struct {
+	Name        string
+	Description string
+	City        string
+	Country     string
+}
+
+// ProviderImage holds facts of an offered system OS image.
+type ProviderImage struct {
+	Name        string
+	Description string
+	OSFlavor    string
+	OSVersion   string
+}
+
 // CloudProvider abstracts Hetzner Cloud infrastructure operations.
 type CloudProvider interface {
+	HasToken() bool
 	CreateServer(ctx context.Context, name string, serverType string, imageName string, location string, sshKeyIDs []string) (*ProviderCreateResult, error)
 	GetServer(ctx context.Context, externalID string) (*ProviderServerStatus, error)
 	DeleteServer(ctx context.Context, externalID string) error
@@ -53,6 +79,9 @@ type CloudProvider interface {
 	ResetPassword(ctx context.Context, externalID string) (string, error)
 	EnableRescue(ctx context.Context, externalID string) (string, error)
 	DisableRescue(ctx context.Context, externalID string) error
+	ListServerTypes(ctx context.Context) ([]ProviderServerType, error)
+	ListLocations(ctx context.Context) ([]ProviderLocation, error)
+	ListImages(ctx context.Context) ([]ProviderImage, error)
 }
 
 // ImageCatalogSource provides live OS images from cloud provider.
