@@ -73,6 +73,7 @@ type UserRepository interface {
 	FindByPhoneHash(ctx context.Context, phoneHash string) (*user.User, error)
 	Save(ctx context.Context, u *user.User) error
 	Count(ctx context.Context) (int64, error)
+	ListUsers(ctx context.Context, limit int) ([]user.User, error)
 }
 
 // InviteRepository handles onboarding tokens.

@@ -53,4 +53,20 @@ func TestMemoryStoreUsersAndInvites(t *testing.T) {
 	if err != nil || len(items) == 0 {
 		t.Fatalf("catalog items err: %v, len %d", err, len(items))
 	}
+
+	// 6. Test ListUsers
+	users, err := s.Users().ListUsers(ctx, 10)
+	if err != nil || len(users) != 1 {
+		t.Fatalf("expected 1 user in ListUsers, got %d, err: %v", len(users), err)
+	}
+
+	// 7. Test Wallet balance update
+	w.BalanceIRT = 250_000
+	if err := s.Wallets().UpdateBalances(ctx, w); err != nil {
+		t.Fatalf("update balances err: %v", err)
+	}
+	w2, err := s.Wallets().GetByUserID(ctx, 200)
+	if err != nil || w2.BalanceIRT != 250_000 {
+		t.Fatalf("expected updated balance 250000, got %d", w2.BalanceIRT)
+	}
 }
