@@ -15,7 +15,9 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
 )
 
@@ -64,13 +66,16 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 }
 
-// HandleUpdate processes a single Telegram update (message or callback query).
+// HandleUpdate processes a single Telegram update (message, callback query, or inline query).
 func (s *Service) HandleUpdate(ctx context.Context, u telego.Update) error {
 	if u.Message != nil {
 		return s.handleMessage(ctx, u.Message)
 	}
 	if u.CallbackQuery != nil {
 		return s.handleCallback(ctx, u.CallbackQuery)
+	}
+	if u.InlineQuery != nil {
+		return s.handleInlineQuery(ctx, u.InlineQuery)
 	}
 	return nil
 }
@@ -80,11 +85,6 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 	userID := msg.From.ID
 	text := strings.TrimSpace(msg.Text)
 	now := time.Now().UTC()
-
-	// Check if message is contact sharing
-	if msg.Contact != nil {
-		return s.handleContact(ctx, msg)
-	}
 
 	// 1. Fetch or create user
 	usr, err := s.store.Users().GetByID(ctx, userID)
@@ -96,6 +96,16 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 	if usr == nil && userID == s.cfg.AdminTelegramID {
 		usr = user.New(userID, msg.From.Username, msg.From.FirstName, msg.From.LastName, user.RoleAdmin, now)
 		_ = s.store.Users().Save(ctx, usr)
+	}
+
+	// Check if message is contact sharing
+	if msg.Contact != nil {
+		return s.handleContact(ctx, msg)
+	}
+
+	// Check if message is a payment receipt photo or document upload
+	if len(msg.Photo) > 0 || msg.Document != nil {
+		return s.handleReceiptUpload(ctx, msg, usr)
 	}
 
 	// 2. Handle /start command (may contain deep-link invite code)
@@ -110,6 +120,15 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 			return nil
 		}
 		return s.sendAdminPortal(ctx, chatID)
+	}
+
+	// 4. Handle /wallet command (admin only)
+	if strings.HasPrefix(text, "/wallet") {
+		if usr == nil || usr.Role != user.RoleAdmin {
+			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
+			return nil
+		}
+		return s.handleAdminWalletCommand(ctx, chatID, text)
 	}
 
 	// Unenrolled user attempting other commands
@@ -253,6 +272,62 @@ func (s *Service) handleCallback(ctx context.Context, cb *telego.CallbackQuery) 
 		return s.sendServerDetail(ctx, chatID, itemID)
 	case data == "wallet:topup_info":
 		return s.sendTopupInfo(ctx, chatID)
+	case data == "admin:wallets":
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		return s.sendAdminWalletsList(ctx, chatID)
+	case strings.HasPrefix(data, "admin:wview:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:wview:"), 10, 64)
+		return s.sendAdminUserWalletView(ctx, chatID, targetUID)
+	case strings.HasPrefix(data, "admin:wadj:add_menu:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:wadj:add_menu:"), 10, 64)
+		return s.sendAdminWalletAdjustMenu(ctx, chatID, targetUID, "add")
+	case strings.HasPrefix(data, "admin:wadj:sub_menu:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:wadj:sub_menu:"), 10, 64)
+		return s.sendAdminWalletAdjustMenu(ctx, chatID, targetUID, "sub")
+	case strings.HasPrefix(data, "admin:wadj:zero:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:wadj:zero:"), 10, 64)
+		return s.handleAdminWalletAdjustExec(ctx, cb, targetUID, "zero", 0)
+	case strings.HasPrefix(data, "admin:wadj:exec:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		parts := strings.Split(data, ":")
+		if len(parts) >= 6 {
+			targetUID, _ := strconv.ParseInt(parts[3], 10, 64)
+			op := parts[4]
+			amount, _ := strconv.ParseInt(parts[5], 10, 64)
+			return s.handleAdminWalletAdjustExec(ctx, cb, targetUID, op, amount)
+		}
+	case strings.HasPrefix(data, "admin:rcpt:app:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			rcptID := parts[3]
+			amount, _ := strconv.ParseInt(parts[4], 10, 64)
+			return s.handleReceiptApproval(ctx, cb, rcptID, amount)
+		}
+	case strings.HasPrefix(data, "admin:rcpt:rej:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		rcptID := strings.TrimPrefix(data, "admin:rcpt:rej:")
+		return s.handleReceiptRejection(ctx, cb, rcptID)
 	}
 
 	return nil
@@ -310,6 +385,10 @@ func (s *Service) sendAdminPortal(ctx context.Context, chatID telego.ChatID) err
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("🎫 ایجاد دعوت‌نامه جدید").WithCallbackData("admin:invite:create"),
+			tu.InlineKeyboardButton("💳 مدیریت کیف پول‌ها").WithCallbackData("admin:wallets"),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("📤 ارسال دعوت اینلاین به چت‌ها").WithSwitchInlineQuery(""),
 		),
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("« بازگشت به منوی اصلی").WithCallbackData("menu:main"),
@@ -381,7 +460,8 @@ func (s *Service) handleGenerateInvite(ctx context.Context, chatID telego.ChatID
 			tu.InlineKeyboardButton("↗️ ورود به ربات (Join Bot)").WithURL(deepLink),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("↗️ ارسال برای دوستان (Share)").WithURL(shareURL),
+			tu.InlineKeyboardButton("📤 ارسال دعوت اینلاین (Inline)").WithSwitchInlineQuery(""),
+			tu.InlineKeyboardButton("↗️ اشتراک سریع").WithURL(shareURL),
 		),
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("« بازگشت به پنل مدیریت").WithCallbackData("admin:home"),
@@ -502,11 +582,13 @@ func (s *Service) sendWallet(ctx context.Context, chatID telego.ChatID, userID i
 
 func (s *Service) sendTopupInfo(ctx context.Context, chatID telego.ChatID) error {
 	text := fmt.Sprintf(
-		"💳 <b>اطلاعات پرداخت جهت شارژ حساب</b>\n\n"+
-			"مبلغ مورد نظر را به شماره کارت زیر واریز فرمایید:\n\n"+
-			"• شماره کارت: <code>1234123412341234</code>\n"+
-			"• بنام: <b>%s</b>\n\n"+
-			"پس از واریز، تصویر رسید یا کد رهگیری را برای پشتیبانی ارسال فرمایید تا کیف پول شما در لحظه شارژ شود.\n\n"+
+		"💳 <b>اطلاعات پرداخت جهت شارژ کیف پول</b>\n\n"+
+			"مبلغ مورد نظر خود را به شماره کارت زیر واریز فرمایید:\n\n"+
+			"• <b>شماره کارت:</b> <code>6037997512345678</code>\n"+
+			"• <b>بنام:</b> <b>%s</b>\n\n"+
+			"📸 <b>ارسال تصویر فیش (اسکرین‌شات):</b>\n"+
+			"پس از واریز، کافیست <b>تصویر فیش یا اسکرین‌شات رسید</b> را مستقیماً همین‌جا در ربات ارسال فرمایید.\n"+
+			"رسید شما به صورت خودکار برای مدیریت ارسال و پس از تایید، کیف پول شما شارژ خواهد شد.\n\n"+
 			"ارتباط با پشتیبانی: %s",
 		s.cfg.CardHolderName,
 		s.cfg.SupportHandle,
@@ -588,4 +670,487 @@ func formatNumber(n int64) string {
 
 func errorsIsNotFound(err error) bool {
 	return err == memory.ErrNotFound
+}
+
+func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) error {
+	botUser := s.botUsername
+	if botUser == "" {
+		botUser = "shop_manovabot"
+	}
+	botUser = strings.TrimPrefix(botUser, "@")
+
+	deepLink := fmt.Sprintf("https://t.me/%s?start=invite", botUser)
+
+	text := "🚀 <b>دعوت به ربات سرورهای ابری مانوا (Hetzner Cloud)</b>\n\n" +
+		"خرید سرورهای ابری Hetzner با تحویل آنی، ترافیک ۲۰ ترابایت رایگان، پردازنده‌های پرسرعت AMD/Intel و هارد NVMe.\n\n" +
+		"جهت پیوستن به ربات و ثبت سفارش، روی دکمه زیر کلیک فرمایید:"
+
+	markup := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("↗️ ورود به ربات (Join Bot)").WithURL(deepLink),
+		),
+	)
+
+	article := (&telego.InlineQueryResultArticle{
+		Type:        "article",
+		ID:          "invite_card",
+		Title:       "🎟️ کارت دعوت به مانوا کلاد (Hetzner Cloud)",
+		Description: "ارسال دعوت‌نامه همراه با دکمه ورود مستقیم به ربات",
+		InputMessageContent: (&telego.InputTextMessageContent{
+			MessageText: text,
+			ParseMode:   telego.ModeHTML,
+		}),
+		ReplyMarkup: markup,
+	})
+
+	return s.bot.AnswerInlineQuery(ctx, &telego.AnswerInlineQueryParams{
+		InlineQueryID: q.ID,
+		Results:       []telego.InlineQueryResult{article},
+		CacheTime:     0,
+		IsPersonal:    true,
+	})
+}
+
+func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, usr *user.User) error {
+	chatID := tu.ID(msg.Chat.ID)
+	userID := msg.From.ID
+
+	if usr == nil {
+		return s.sendAccessDenied(ctx, chatID)
+	}
+
+	var fileID string
+	if len(msg.Photo) > 0 {
+		fileID = msg.Photo[len(msg.Photo)-1].FileID
+	} else if msg.Document != nil {
+		fileID = msg.Document.FileID
+	}
+
+	if fileID == "" {
+		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ فایل ارسالی معتبر نیست."))
+		return nil
+	}
+
+	rcptID := fmt.Sprintf("rcpt-%d", time.Now().UnixNano()/1e6)
+	now := time.Now().UTC()
+
+	rcp := &receipt.Receipt{
+		ID:        rcptID,
+		UserID:    userID,
+		Purpose:   receipt.PurposeWalletTopup,
+		ImageRef:  fileID,
+		Status:    receipt.StatusPendingReview,
+		CreatedAt: now,
+	}
+
+	_ = s.store.Receipts().Save(ctx, rcp)
+
+	// Acknowledge user
+	ackText := fmt.Sprintf(
+		"✅ <b>رسید پرداخت شما دریافت شد!</b>\n\n"+
+			"• <b>شناسه پیگیری:</b> <code>%s</code>\n"+
+			"• <b>وضعیت:</b> در انتظار بررسی مدیریت ⏳\n\n"+
+			"رسید شما جهت بررسی و تایید برای مدیریت ارسال گردید. به محض تایید، کیف پول شما به صورت خودکار شارژ خواهد شد.",
+		rcptID,
+	)
+	_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, ackText).WithParseMode(telego.ModeHTML))
+
+	// Forward to Admin
+	if s.cfg.AdminTelegramID != 0 {
+		adminChatID := tu.ID(s.cfg.AdminTelegramID)
+		caption := fmt.Sprintf(
+			"🧾 <b>رسید پرداخت جدید برای شارژ کیف پول</b>\n\n"+
+				"• <b>کاربر:</b> <code>%d</code> (@%s)\n"+
+				"• <b>نام:</b> %s %s\n"+
+				"• <b>شناسه رسید:</b> <code>%s</code>\n"+
+				"• <b>زمان:</b> <code>%s</code>\n\n"+
+				"مبلغ واریزی را جهت تایید و شارژ خودکار انتخاب فرمایید:",
+			userID,
+			msg.From.Username,
+			msg.From.FirstName,
+			msg.From.LastName,
+			rcptID,
+			now.Format("2006-01-02 15:04:05 UTC"),
+		)
+		if msg.Caption != "" {
+			caption += fmt.Sprintf("\n• <b>توضیحات کاربر:</b> <i>%s</i>\n", msg.Caption)
+		}
+
+		adminMarkup := tu.InlineKeyboard(
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("💰 ۱۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:100000", rcptID)),
+				tu.InlineKeyboardButton("💰 ۲۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:250000", rcptID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("💰 ۵۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:500000", rcptID)),
+				tu.InlineKeyboardButton("💰 ۱,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:1000000", rcptID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("💰 ۲,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:2000000", rcptID)),
+				tu.InlineKeyboardButton("💰 ۵,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:5000000", rcptID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("❌ رد رسید (Reject)").WithCallbackData(fmt.Sprintf("admin:rcpt:rej:%s", rcptID)),
+			),
+		)
+
+		if len(msg.Photo) > 0 {
+			_, _ = s.bot.SendPhoto(ctx, tu.Photo(adminChatID, tu.FileFromID(fileID)).
+				WithCaption(caption).
+				WithParseMode(telego.ModeHTML).
+				WithReplyMarkup(adminMarkup))
+		} else {
+			_, _ = s.bot.SendMessage(ctx, tu.Message(adminChatID, caption).
+				WithParseMode(telego.ModeHTML).
+				WithReplyMarkup(adminMarkup))
+		}
+	}
+
+	return nil
+}
+
+func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.CallbackQuery, rcptID string, amountIRT int64) error {
+	adminID := cb.From.ID
+	now := time.Now().UTC()
+
+	rcp, err := s.store.Receipts().GetByID(ctx, rcptID)
+	if err != nil || rcp == nil {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
+		return nil
+	}
+
+	if rcp.Status == receipt.StatusApproved || rcp.Status == receipt.StatusRejected {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
+		return nil
+	}
+
+	if err := rcp.Approve(adminID, now); err != nil {
+		return err
+	}
+	rcp.AmountIRT = pricing.IRT(amountIRT)
+	_ = s.store.Receipts().Save(ctx, rcp)
+
+	// Credit user's wallet
+	w, err := s.store.Wallets().GetByUserID(ctx, rcp.UserID)
+	if err != nil {
+		return err
+	}
+	w.BalanceIRT += pricing.IRT(amountIRT)
+	if err := s.store.Wallets().UpdateBalances(ctx, w); err != nil {
+		return err
+	}
+
+	_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
+		ID:           fmt.Sprintf("ledg-rcpt-%d", time.Now().UnixNano()),
+		WalletID:     w.ID,
+		Currency:     wallet.CurrencyIRT,
+		Amount:       amountIRT,
+		Kind:         wallet.KindTopupReceipt,
+		BalanceAfter: int64(w.BalanceIRT),
+		CreatedAt:    now,
+	})
+
+	// 1. Notify User
+	userNotice := fmt.Sprintf(
+		"🎉 <b>رسید پرداخت شما تایید شد!</b>\n\n"+
+			"• <b>مبلغ شارژ شده:</b> <code>%s تومان</code>\n"+
+			"• <b>شناسه رسید:</b> <code>%s</code>\n"+
+			"• <b>موجودی جدید کیف پول:</b> <code>%s تومان</code>\n\n"+
+			"هم‌اکنون می‌توانید سرور ابری مورد نظر خود را خریداری فرمایید.",
+		formatNumber(amountIRT),
+		rcp.ID,
+		formatNumber(int64(w.BalanceIRT)),
+	)
+	_, _ = s.bot.SendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
+
+	// 2. Update Admin message
+	adminConfirm := fmt.Sprintf(
+		"✅ <b>رسید %s تایید شد</b>\n\n"+
+			"• مبلغ: <code>%s تومان</code>\n"+
+			"• به کیف پول کاربر <code>%d</code> افزوده شد.\n"+
+			"• موجودی فعلی: <code>%s تومان</code>\n"+
+			"• زمان تایید: %s",
+		rcptID,
+		formatNumber(amountIRT),
+		rcp.UserID,
+		formatNumber(int64(w.BalanceIRT)),
+		now.Format("15:04:05 UTC"),
+	)
+	if cb.Message != nil {
+		chatID := tu.ID(cb.Message.GetChat().ID)
+		msgID := cb.Message.GetMessageID()
+		if m := cb.Message.Message(); m != nil && len(m.Photo) > 0 {
+			_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
+		} else {
+			_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
+		}
+	}
+
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("رسید تایید و %s تومان شارژ شد.", formatNumber(amountIRT))))
+	return nil
+}
+
+func (s *Service) handleReceiptRejection(ctx context.Context, cb *telego.CallbackQuery, rcptID string) error {
+	adminID := cb.From.ID
+	now := time.Now().UTC()
+
+	rcp, err := s.store.Receipts().GetByID(ctx, rcptID)
+	if err != nil || rcp == nil {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
+		return nil
+	}
+
+	if rcp.Status == receipt.StatusApproved || rcp.Status == receipt.StatusRejected {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
+		return nil
+	}
+
+	if err := rcp.Reject(adminID, receipt.RejectOther, "Rejected by admin", now); err != nil {
+		return err
+	}
+	_ = s.store.Receipts().Save(ctx, rcp)
+
+	// Notify User
+	userNotice := fmt.Sprintf(
+		"❌ <b>رسید پرداخت شما تایید نشد</b>\n\n"+
+			"• <b>شناسه رسید:</b> <code>%s</code>\n\n"+
+			"رسید ارسالی توسط مدیریت تایید نگردید. در صورت کسر وجه از حسابتان یا نیاز به پیگیری، با پشتیبانی (%s) در ارتباط باشید.",
+		rcp.ID,
+		s.cfg.SupportHandle,
+	)
+	_, _ = s.bot.SendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
+
+	// Update Admin message
+	adminReject := fmt.Sprintf(
+		"❌ <b>رسید %s رد شد</b>\nکاربر: <code>%d</code>",
+		rcptID,
+		rcp.UserID,
+	)
+	if cb.Message != nil {
+		chatID := tu.ID(cb.Message.GetChat().ID)
+		msgID := cb.Message.GetMessageID()
+		if m := cb.Message.Message(); m != nil && len(m.Photo) > 0 {
+			_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
+		} else {
+			_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
+		}
+	}
+
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("رسید رد شد."))
+	return nil
+}
+
+func (s *Service) sendAdminWalletsList(ctx context.Context, chatID telego.ChatID) error {
+	users, err := s.store.Users().ListUsers(ctx, 25)
+	if err != nil {
+		return err
+	}
+
+	text := "💳 <b>مدیریت کیف پول کاربران</b>\n\n" +
+		"جهت مشاهده موجودی، شارژ یا کسر از کیف پول، کاربر مورد نظر را انتخاب فرمایید:\n" +
+		"<i>(همچنین می‌توانید دستور <code>/wallet [شناسه_کاربر]</code> را ارسال کنید)</i>"
+
+	var rows [][]telego.InlineKeyboardButton
+	for _, u := range users {
+		w, _ := s.store.Wallets().GetByUserID(ctx, u.TelegramUserID)
+		var balIRT int64
+		if w != nil {
+			balIRT = int64(w.BalanceIRT)
+		}
+		displayName := u.FirstName
+		if u.Username != "" {
+			displayName = "@" + u.Username
+		}
+		label := fmt.Sprintf("%s (%d) — %s ت", displayName, u.TelegramUserID, formatNumber(balIRT))
+		rows = append(rows, tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton(label).WithCallbackData(fmt.Sprintf("admin:wview:%d", u.TelegramUserID)),
+		))
+	}
+
+	rows = append(rows, tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("« بازگشت به پنل مدیریت").WithCallbackData("admin:home"),
+	))
+
+	markup := tu.InlineKeyboard(rows...)
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) sendAdminUserWalletView(ctx context.Context, chatID telego.ChatID, targetUserID int64) error {
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ کاربری با شناسه <code>%d</code> یافت نشد.", targetUserID)).WithParseMode(telego.ModeHTML))
+		return nil
+	}
+
+	w, err := s.store.Wallets().GetByUserID(ctx, targetUserID)
+	if err != nil {
+		return err
+	}
+
+	text := fmt.Sprintf(
+		"👤 <b>مدیریت کیف پول کاربر</b>\n\n"+
+			"• <b>نام:</b> %s %s\n"+
+			"• <b>نام کاربری:</b> @%s\n"+
+			"• <b>شناسه تلگرام:</b> <code>%d</code>\n"+
+			"• <b>سطح کاربری:</b> %s\n\n"+
+			"💰 <b>موجودی فعلی:</b>\n"+
+			"• تومانی: <code>%s تومان</code>\n"+
+			"• دلاری: <code>%0.2f USD</code>\n\n"+
+			"عملیات مورد نظر را انتخاب فرمایید:",
+		u.FirstName, u.LastName,
+		u.Username,
+		u.TelegramUserID,
+		u.Segment,
+		formatNumber(int64(w.BalanceIRT)),
+		float64(w.BalanceUSDMicro)/1_000_000.0,
+	)
+
+	markup := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("➕ شارژ کیف پول (افزایش)").WithCallbackData(fmt.Sprintf("admin:wadj:add_menu:%d", targetUserID)),
+			tu.InlineKeyboardButton("➖ کسر از موجودی (کاهش)").WithCallbackData(fmt.Sprintf("admin:wadj:sub_menu:%d", targetUserID)),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🔄 صفر کردن موجودی").WithCallbackData(fmt.Sprintf("admin:wadj:zero:%d", targetUserID)),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("« بازگشت به لیست کیف پول‌ها").WithCallbackData("admin:wallets"),
+		),
+	)
+
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) sendAdminWalletAdjustMenu(ctx context.Context, chatID telego.ChatID, targetUserID int64, op string) error {
+	w, err := s.store.Wallets().GetByUserID(ctx, targetUserID)
+	if err != nil {
+		return err
+	}
+
+	var title string
+	var rows [][]telego.InlineKeyboardButton
+
+	if op == "add" {
+		title = fmt.Sprintf("➕ <b>افزایش موجودی کاربر <code>%d</code></b>\n\nموجودی فعلی: <code>%s تومان</code>\n\nمبلغ شارژ را انتخاب فرمایید:",
+			targetUserID, formatNumber(int64(w.BalanceIRT)))
+		rows = append(rows,
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("+۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:50000", targetUserID)),
+				tu.InlineKeyboardButton("+۱۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:100000", targetUserID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("+۲۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:250000", targetUserID)),
+				tu.InlineKeyboardButton("+۵۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:500000", targetUserID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("+۱,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:1000000", targetUserID)),
+				tu.InlineKeyboardButton("+۲,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:2000000", targetUserID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("+۵,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:add:5000000", targetUserID)),
+			),
+		)
+	} else {
+		title = fmt.Sprintf("➖ <b>کسر از موجودی کاربر <code>%d</code></b>\n\nموجودی فعلی: <code>%s تومان</code>\n\nمبلغ کسر را انتخاب فرمایید:",
+			targetUserID, formatNumber(int64(w.BalanceIRT)))
+		rows = append(rows,
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("-۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:sub:50000", targetUserID)),
+				tu.InlineKeyboardButton("-۱۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:sub:100000", targetUserID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("-۲۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:sub:250000", targetUserID)),
+				tu.InlineKeyboardButton("-۵۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:sub:500000", targetUserID)),
+			),
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("-۱,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:wadj:exec:%d:sub:1000000", targetUserID)),
+			),
+		)
+	}
+
+	rows = append(rows, tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("« انصراف و بازگشت").WithCallbackData(fmt.Sprintf("admin:wview:%d", targetUserID)),
+	))
+
+	markup := tu.InlineKeyboard(rows...)
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, title).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) handleAdminWalletAdjustExec(ctx context.Context, cb *telego.CallbackQuery, targetUserID int64, op string, amountIRT int64) error {
+	chatID := tu.ID(cb.Message.GetChat().ID)
+	now := time.Now().UTC()
+
+	w, err := s.store.Wallets().GetByUserID(ctx, targetUserID)
+	if err != nil {
+		return err
+	}
+
+	var opDesc string
+	var deltaText string
+
+	switch op {
+	case "add":
+		w.BalanceIRT += pricing.IRT(amountIRT)
+		opDesc = "افزایش موجودی"
+		deltaText = fmt.Sprintf("+%s تومان", formatNumber(amountIRT))
+	case "sub":
+		w.BalanceIRT -= pricing.IRT(amountIRT)
+		opDesc = "کاهش موجودی"
+		deltaText = fmt.Sprintf("-%s تومان", formatNumber(amountIRT))
+	case "zero":
+		w.BalanceIRT = 0
+		opDesc = "صفر کردن موجودی"
+		deltaText = "موجودی صفر شد"
+	}
+
+	if err := s.store.Wallets().UpdateBalances(ctx, w); err != nil {
+		return err
+	}
+
+	_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
+		ID:           fmt.Sprintf("ledg-adm-%d", time.Now().UnixNano()),
+		WalletID:     w.ID,
+		Currency:     wallet.CurrencyIRT,
+		Amount:       amountIRT,
+		Kind:         wallet.KindAdminAdjustment,
+		BalanceAfter: int64(w.BalanceIRT),
+		CreatedAt:    now,
+	})
+
+	// 1. Notify target user in Telegram
+	userNotice := fmt.Sprintf(
+		"🔔 <b>بروزرسانی موجودی کیف پول</b>\n\n"+
+			"موجودی کیف پول شما توسط مدیریت بروزرسانی شد:\n"+
+			"• <b>عملیات:</b> %s\n"+
+			"• <b>میزان تغییر:</b> <code>%s</code>\n"+
+			"• <b>موجودی جدید شما:</b> <code>%s تومان</code>",
+		opDesc,
+		deltaText,
+		formatNumber(int64(w.BalanceIRT)),
+	)
+	_, _ = s.bot.SendMessage(ctx, tu.Message(tu.ID(targetUserID), userNotice).WithParseMode(telego.ModeHTML))
+
+	// 2. Alert admin and return to wallet view
+	confirmMsg := fmt.Sprintf("موجودی با موفقیت بروزرسانی شد. جدید: %s تومان", formatNumber(int64(w.BalanceIRT)))
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(confirmMsg))
+
+	return s.sendAdminUserWalletView(ctx, chatID, targetUserID)
+}
+
+func (s *Service) handleAdminWalletCommand(ctx context.Context, chatID telego.ChatID, text string) error {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		return s.sendAdminWalletsList(ctx, chatID)
+	}
+
+	targetUID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ شناسه کاربری نامعتبر است. فرمت صحیح: <code>/wallet 12345678</code>").WithParseMode(telego.ModeHTML))
+		return nil
+	}
+
+	return s.sendAdminUserWalletView(ctx, chatID, targetUID)
 }

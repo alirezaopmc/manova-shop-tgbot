@@ -229,6 +229,19 @@ func (r *userRepo) Count(_ context.Context) (int64, error) {
 	return int64(len(r.s.users)), nil
 }
 
+func (r *userRepo) ListUsers(_ context.Context, limit int) ([]user.User, error) {
+	r.s.mu.RLock()
+	defer r.s.mu.RUnlock()
+	var out []user.User
+	for _, u := range r.s.users {
+		out = append(out, *u)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 // --- InviteRepo ---
 
 type inviteRepo struct{ s *Store }
