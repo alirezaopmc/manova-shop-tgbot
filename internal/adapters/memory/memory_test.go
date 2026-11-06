@@ -69,4 +69,34 @@ func TestMemoryStoreUsersAndInvites(t *testing.T) {
 	if err != nil || w2.BalanceIRT != 250_000 {
 		t.Fatalf("expected updated balance 250000, got %d", w2.BalanceIRT)
 	}
+
+	// 8. Ensure no static backdoor invites exist
+	if _, err := s.Invites().GetByCode(ctx, "invite"); err == nil {
+		t.Fatalf("static invite code 'invite' must not exist in store")
+	}
+	if _, err := s.Invites().GetByCode(ctx, "shop"); err == nil {
+		t.Fatalf("static invite code 'shop' must not exist in store")
+	}
+
+	// 9. Second claim on single-use invite must fail
+	if _, err := s.Invites().Claim(ctx, inv.Code, 300, now); err == nil {
+		t.Fatalf("expected second claim on single-use invite to fail")
+	}
+
+	// 10. Phone index unlinking on reset
+	hash := "test-hash-123"
+	u.PhoneHash = &hash
+	if err := s.Users().Save(ctx, u); err != nil {
+		t.Fatalf("save with phone hash err: %v", err)
+	}
+	if found, err := s.Users().FindByPhoneHash(ctx, hash); err != nil || found.TelegramUserID != 200 {
+		t.Fatalf("expected find by phone hash to succeed")
+	}
+	u.PhoneHash = nil
+	if err := s.Users().Save(ctx, u); err != nil {
+		t.Fatalf("save after clearing phone hash err: %v", err)
+	}
+	if _, err := s.Users().FindByPhoneHash(ctx, hash); err == nil {
+		t.Fatalf("expected find by phone hash to fail after clearing")
+	}
 }

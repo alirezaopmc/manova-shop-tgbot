@@ -119,3 +119,29 @@ func (u *User) SetVerifiedPhone(phoneE164 string, phoneHash string, now time.Tim
 func (u *User) IsPhoneVerified() bool {
 	return u.PhoneVerifiedAt != nil && u.PhoneE164 != nil && *u.PhoneE164 != ""
 }
+
+// SetBlocked updates user blocked status.
+func (u *User) SetBlocked(blocked bool, now time.Time) {
+	u.Blocked = blocked
+	u.UpdatedAt = now
+}
+
+// SetSegment updates user fee segment tier.
+func (u *User) SetSegment(segment fee.Segment, now time.Time) {
+	u.Segment = segment
+	u.UpdatedAt = now
+}
+
+// SetRole updates user role (USER / ADMIN).
+func (u *User) SetRole(role Role, now time.Time) {
+	u.Role = role
+	u.UpdatedAt = now
+}
+
+// ResetPhone unlinks phone verification from user profile.
+func (u *User) ResetPhone(now time.Time) {
+	u.PhoneE164 = nil
+	u.PhoneHash = nil
+	u.PhoneVerifiedAt = nil
+	u.UpdatedAt = now
+}

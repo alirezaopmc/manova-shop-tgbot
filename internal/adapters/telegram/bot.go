@@ -13,6 +13,7 @@ import (
 	tu "github.com/mymmrac/telego/telegoutil"
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
@@ -98,6 +99,12 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 		_ = s.store.Users().Save(ctx, usr)
 	}
 
+	// Reject blocked users
+	if usr != nil && usr.Blocked {
+		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب کاربری شما مسدود است. لطفاً با پشتیبانی در ارتباط باشید: %s", s.cfg.SupportHandle)))
+		return nil
+	}
+
 	// Check if message is contact sharing
 	if msg.Contact != nil {
 		return s.handleContact(ctx, msg)
@@ -131,6 +138,15 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 		return s.handleAdminWalletCommand(ctx, chatID, text)
 	}
 
+	// 5. Handle /user command (admin only)
+	if strings.HasPrefix(text, "/user") {
+		if usr == nil || usr.Role != user.RoleAdmin {
+			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
+			return nil
+		}
+		return s.handleAdminUserCommand(ctx, chatID, text)
+	}
+
 	// Unenrolled user attempting other commands
 	if usr == nil {
 		return s.sendAccessDenied(ctx, chatID)
@@ -146,6 +162,10 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 
 	// If user already enrolled:
 	if usr != nil {
+		if usr.Blocked {
+			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب کاربری شما مسدود است. لطفاً با پشتیبانی در ارتباط باشید: %s", s.cfg.SupportHandle)))
+			return nil
+		}
 		return s.sendMainMenu(ctx, chatID, usr)
 	}
 
@@ -155,16 +175,7 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 		return s.sendAccessDenied(ctx, chatID)
 	}
 
-	// Auto-seed unlimited invite if using general/referral code (e.g. "invite", "shop", "inline", or admin ID)
-	if rawCode == "invite" || rawCode == "shop" || rawCode == "inline" || strings.HasPrefix(rawCode, "ref_") || rawCode == fmt.Sprintf("%d", s.cfg.AdminTelegramID) {
-		if _, getErr := s.store.Invites().GetByCode(ctx, rawCode); getErr != nil {
-			autoInv := invite.New(s.cfg.AdminTelegramID, 0, nil, now)
-			autoInv.Code = rawCode
-			_ = s.store.Invites().Create(ctx, autoInv)
-		}
-	}
-
-	// Validate and claim invite
+	// Validate and claim invite (strict verification)
 	inv, err := s.store.Invites().Claim(ctx, rawCode, userID, now)
 	if err != nil {
 		errMsg := fmt.Sprintf("❌ <b>کد دعوت نامعتبر است</b>\n\nکد وارد شده معتبر نیست، منقضی شده یا ظرفیت آن تکمیل شده است.\n\nبرای دریافت دعوت‌نامه جدید با پشتیبانی تماس بگیرید: %s", s.cfg.SupportHandle)
@@ -245,9 +256,16 @@ func (s *Service) handleCallback(ctx context.Context, cb *telego.CallbackQuery) 
 		}
 	}
 
+	if usr.Blocked {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⛔ حساب کاربری شما مسدود است.").WithShowAlert())
+		return nil
+	}
+
 	switch {
 	case data == "menu:main":
 		return s.sendMainMenu(ctx, chatID, usr)
+	case data == "menu:settings":
+		return s.sendUserSettings(ctx, chatID, usr)
 	case data == "menu:catalog":
 		return s.sendCatalog(ctx, chatID)
 	case data == "menu:wallet":
@@ -261,6 +279,59 @@ func (s *Service) handleCallback(ctx context.Context, cb *telego.CallbackQuery) 
 			return nil
 		}
 		return s.sendAdminPortal(ctx, chatID)
+	case data == "admin:users":
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		return s.sendAdminUsersList(ctx, chatID)
+	case strings.HasPrefix(data, "admin:uview:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:uview:"), 10, 64)
+		return s.sendAdminUserDetailView(ctx, chatID, targetUID)
+	case strings.HasPrefix(data, "admin:uset:seg:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:uset:seg:"), 10, 64)
+		return s.sendAdminUserSegmentMenu(ctx, chatID, targetUID)
+	case strings.HasPrefix(data, "admin:uset:set_seg:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			targetUID, _ := strconv.ParseInt(parts[3], 10, 64)
+			seg := parts[4]
+			return s.handleAdminUserSetSegment(ctx, cb, chatID, targetUID, seg)
+		}
+	case strings.HasPrefix(data, "admin:uset:block:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			targetUID, _ := strconv.ParseInt(parts[3], 10, 64)
+			blocked := parts[4] == "1"
+			return s.handleAdminUserSetBlock(ctx, cb, chatID, targetUID, blocked)
+		}
+	case strings.HasPrefix(data, "admin:uset:role:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			targetUID, _ := strconv.ParseInt(parts[3], 10, 64)
+			role := parts[4]
+			return s.handleAdminUserSetRole(ctx, cb, chatID, targetUID, role)
+		}
+	case strings.HasPrefix(data, "admin:uset:reset_phone:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		targetUID, _ := strconv.ParseInt(strings.TrimPrefix(data, "admin:uset:reset_phone:"), 10, 64)
+		return s.handleAdminUserResetPhone(ctx, cb, chatID, targetUID)
 	case data == "admin:invite:create":
 		if usr.Role != user.RoleAdmin {
 			return nil
@@ -357,9 +428,10 @@ func (s *Service) sendMainMenu(ctx context.Context, chatID telego.ChatID, usr *u
 		),
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("💰 کیف پول و موجودی").WithCallbackData("menu:wallet"),
-			tu.InlineKeyboardRow(tu.InlineKeyboardButton("📱 تایید موبایل").WithCallbackData("menu:phone"))[0],
+			tu.InlineKeyboardButton("⚙️ مشخصات و تنظیمات").WithCallbackData("menu:settings"),
 		),
 		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("📱 تایید موبایل").WithCallbackData("menu:phone"),
 			tu.InlineKeyboardButton("ℹ️ پشتیبانی و راهنما").WithCallbackData("menu:support"),
 		),
 	}
@@ -390,10 +462,11 @@ func (s *Service) sendAdminPortal(ctx context.Context, chatID telego.ChatID) err
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🎫 ایجاد دعوت‌نامه جدید").WithCallbackData("admin:invite:create"),
+			tu.InlineKeyboardButton("👥 مدیریت کاربران و تنظیمات").WithCallbackData("admin:users"),
 			tu.InlineKeyboardButton("💳 مدیریت کیف پول‌ها").WithCallbackData("admin:wallets"),
 		),
 		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🎫 ایجاد دعوت‌نامه جدید").WithCallbackData("admin:invite:create"),
 			tu.InlineKeyboardButton("📤 ارسال دعوت اینلاین به چت‌ها").WithSwitchInlineQuery(""),
 		),
 		tu.InlineKeyboardRow(
@@ -675,38 +748,94 @@ func errorsIsNotFound(err error) bool {
 }
 
 func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) error {
+	senderID := q.From.ID
+	now := time.Now().UTC()
+
+	isAdmin := senderID == s.cfg.AdminTelegramID
+	if !isAdmin {
+		usr, _ := s.store.Users().GetByID(ctx, senderID)
+		if usr != nil && usr.Role == user.RoleAdmin {
+			isAdmin = true
+		}
+	}
+
+	if !isAdmin {
+		article := (&telego.InlineQueryResultArticle{
+			Type:        "article",
+			ID:          "access_denied",
+			Title:       "⛔ دسترسی غیرمجاز",
+			Description: "تنها مدیریت مجاز به صدور کارت دعوت است.",
+			InputMessageContent: (&telego.InputTextMessageContent{
+				MessageText: "⛔ شما دسترسی لازم برای صدور کارت دعوت را ندارید.",
+			}),
+		})
+		return s.bot.AnswerInlineQuery(ctx, &telego.AnswerInlineQueryParams{
+			InlineQueryID: q.ID,
+			Results:       []telego.InlineQueryResult{article},
+			CacheTime:     0,
+			IsPersonal:    true,
+		})
+	}
+
 	botUser := s.botUsername
 	if botUser == "" {
 		botUser = "shop_manovabot"
 	}
 	botUser = strings.TrimPrefix(botUser, "@")
 
-	deepLink := fmt.Sprintf("https://t.me/%s?start=invite", botUser)
+	var results []telego.InlineQueryResult
 
-	text := "🛍️ <b>فروشگاه مانوا | Manova Shop</b>\n\n" +
-		"خرید سرورهای ابری Hetzner Cloud با تحویل آنی"
+	// 1. Single-use invitation (Default, strict security: 1 user only)
+	inv1 := invite.New(senderID, 1, nil, now)
+	if err := s.store.Invites().Create(ctx, inv1); err == nil {
+		deepLink1 := fmt.Sprintf("https://t.me/%s?start=invite_%s", botUser, inv1.Code)
+		text1 := "🛍️ <b>فروشگاه مانوا | Manova Shop</b>\n\n" +
+			"دعوت‌نامه اختصاصی ورود به فروشگاه سرورهای ابری"
+		markup1 := tu.InlineKeyboard(
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink1),
+			),
+		)
+		results = append(results, &telego.InlineQueryResultArticle{
+			Type:        "article",
+			ID:          fmt.Sprintf("inv_1_%s", inv1.Code),
+			Title:       "🎫 کارت دعوت یک‌بار مصرف (تک‌کاربره)",
+			Description: fmt.Sprintf("کد اختصاصی: %s (ظرفیت ۱ نفر)", inv1.Code),
+			InputMessageContent: &telego.InputTextMessageContent{
+				MessageText: text1,
+				ParseMode:   telego.ModeHTML,
+			},
+			ReplyMarkup: markup1,
+		})
+	}
 
-	markup := tu.InlineKeyboard(
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink),
-		),
-	)
-
-	article := (&telego.InlineQueryResultArticle{
-		Type:        "article",
-		ID:          "invite_card",
-		Title:       "🛍️ فروشگاه مانوا (Manova Shop)",
-		Description: "کارت دعوت به فروشگاه مانوا",
-		InputMessageContent: (&telego.InputTextMessageContent{
-			MessageText: text,
-			ParseMode:   telego.ModeHTML,
-		}),
-		ReplyMarkup: markup,
-	})
+	// 2. 5-use invitation (For inviting small team)
+	inv5 := invite.New(senderID, 5, nil, now)
+	if err := s.store.Invites().Create(ctx, inv5); err == nil {
+		deepLink5 := fmt.Sprintf("https://t.me/%s?start=invite_%s", botUser, inv5.Code)
+		text5 := "🛍️ <b>فروشگاه مانوا | Manova Shop</b>\n\n" +
+			"دعوت‌نامه اختصاصی ورود به فروشگاه سرورهای ابری"
+		markup5 := tu.InlineKeyboard(
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink5),
+			),
+		)
+		results = append(results, &telego.InlineQueryResultArticle{
+			Type:        "article",
+			ID:          fmt.Sprintf("inv_5_%s", inv5.Code),
+			Title:       "🎫 کارت دعوت ۵ کاربره",
+			Description: fmt.Sprintf("کد اختصاصی: %s (ظرفیت ۵ نفر)", inv5.Code),
+			InputMessageContent: &telego.InputTextMessageContent{
+				MessageText: text5,
+				ParseMode:   telego.ModeHTML,
+			},
+			ReplyMarkup: markup5,
+		})
+	}
 
 	return s.bot.AnswerInlineQuery(ctx, &telego.AnswerInlineQueryParams{
 		InlineQueryID: q.ID,
-		Results:       []telego.InlineQueryResult{article},
+		Results:       results,
 		CacheTime:     0,
 		IsPersonal:    true,
 	})
@@ -1154,4 +1283,344 @@ func (s *Service) handleAdminWalletCommand(ctx context.Context, chatID telego.Ch
 	}
 
 	return s.sendAdminUserWalletView(ctx, chatID, targetUID)
+}
+
+func (s *Service) sendUserSettings(ctx context.Context, chatID telego.ChatID, usr *user.User) error {
+	discount := "۱۰٪ (عادی)"
+	switch usr.Segment {
+	case fee.SegmentCustomer:
+		discount = "۳٪ (ویژه)"
+	case fee.SegmentLoyal:
+		discount = "۱٪ (وفادار)"
+	}
+
+	phoneText := "❌ تایید نشده"
+	if usr.IsPhoneVerified() && usr.PhoneE164 != nil {
+		phoneText = fmt.Sprintf("✅ تایید شده (%s)", *usr.PhoneE164)
+	}
+
+	regDate := usr.CreatedAt.Format("2006-01-02 15:04")
+
+	text := fmt.Sprintf(
+		"⚙️ <b>مشخصات و حساب کاربری شما</b>\n\n"+
+			"• <b>شناسه کاربری:</b> <code>%d</code>\n"+
+			"• <b>نام:</b> %s %s\n"+
+			"• <b>نام کاربری:</b> @%s\n"+
+			"• <b>سطح کاربری:</b> <code>%s</code>\n"+
+			"• <b>کارمزد خرید:</b> %s\n"+
+			"• <b>وضعیت موبایل:</b> %s\n"+
+			"• <b>تاریخ عضویت:</b> %s",
+		usr.TelegramUserID,
+		usr.FirstName, usr.LastName,
+		usr.Username,
+		usr.Segment,
+		discount,
+		phoneText,
+		regDate,
+	)
+
+	var rows [][]telego.InlineKeyboardButton
+	if !usr.IsPhoneVerified() {
+		rows = append(rows, tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("📱 تایید شماره موبایل").WithCallbackData("menu:phone"),
+		))
+	}
+	rows = append(rows, tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("« بازگشت به منوی اصلی").WithCallbackData("menu:main"),
+	))
+
+	markup := tu.InlineKeyboard(rows...)
+	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) sendAdminUsersList(ctx context.Context, chatID telego.ChatID) error {
+	users, err := s.store.Users().ListUsers(ctx, 30)
+	if err != nil {
+		return err
+	}
+
+	text := "👥 <b>مدیریت کاربران و تنظیمات</b>\n\n" +
+		"جهت مشاهده پرونده، تغییر سطح کارمزد، مسدودسازی، تغییر نقش یا مدیریت کیف پول، کاربر مورد نظر را انتخاب نمایید:\n" +
+		"<i>(همچنین می‌توانید از دستور <code>/user [شناسه_کاربر]</code> استفاده کنید)</i>"
+
+	var rows [][]telego.InlineKeyboardButton
+	for _, u := range users {
+		displayName := u.FirstName
+		if u.Username != "" {
+			displayName = "@" + u.Username
+		}
+		statusIcon := "🟢"
+		if u.Blocked {
+			statusIcon = "⛔"
+		}
+		roleIcon := "👤"
+		if u.Role == user.RoleAdmin {
+			roleIcon = "🛡️"
+		}
+
+		label := fmt.Sprintf("%s %s %s (%s)", statusIcon, roleIcon, displayName, u.Segment)
+		rows = append(rows, tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton(label).WithCallbackData(fmt.Sprintf("admin:uview:%d", u.TelegramUserID)),
+		))
+	}
+
+	rows = append(rows, tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("« بازگشت به پنل مدیریت").WithCallbackData("admin:home"),
+	))
+
+	markup := tu.InlineKeyboard(rows...)
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) sendAdminUserDetailView(ctx context.Context, chatID telego.ChatID, targetUserID int64) error {
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ کاربری با شناسه <code>%d</code> یافت نشد.", targetUserID)).WithParseMode(telego.ModeHTML))
+		return nil
+	}
+
+	w, _ := s.store.Wallets().GetByUserID(ctx, targetUserID)
+	var balIRT int64
+	if w != nil {
+		balIRT = int64(w.BalanceIRT)
+	}
+
+	statusStr := "🟢 فعال (Active)"
+	if u.Blocked {
+		statusStr = "⛔ مسدود (Blocked)"
+	}
+
+	roleStr := "کاربر عادی (USER)"
+	if u.Role == user.RoleAdmin {
+		roleStr = "🛡️ مدیر (ADMIN)"
+	}
+
+	phoneStr := "❌ ثبت نشده"
+	if u.IsPhoneVerified() && u.PhoneE164 != nil {
+		phoneStr = fmt.Sprintf("✅ %s", *u.PhoneE164)
+	}
+
+	var invitedByStr string
+	if u.InvitedBy != nil {
+		invitedByStr = fmt.Sprintf("<code>%d</code>", *u.InvitedBy)
+	} else {
+		invitedByStr = "سیستم"
+	}
+
+	var inviteCodeStr string
+	if u.InviteCode != nil {
+		inviteCodeStr = fmt.Sprintf("<code>%s</code>", *u.InviteCode)
+	} else {
+		inviteCodeStr = "-"
+	}
+
+	text := fmt.Sprintf(
+		"👤 <b>پرونده و تنظیمات کاربر</b>\n\n"+
+			"• <b>شناسه تلگرام:</b> <code>%d</code>\n"+
+			"• <b>نام:</b> %s %s\n"+
+			"• <b>نام کاربری:</b> @%s\n"+
+			"• <b>وضعیت حساب:</b> %s\n"+
+			"• <b>نقش سیستم:</b> %s\n"+
+			"• <b>سطح کارمزد:</b> <code>%s</code>\n"+
+			"• <b>وضعیت شماره همراه:</b> %s\n"+
+			"• <b>موجودی کیف پول:</b> <code>%s تومان</code>\n"+
+			"• <b>کد دعوت معرف:</b> %s (توسط %s)\n"+
+			"• <b>تاریخ عضویت:</b> %s\n\n"+
+			"جهت اعمال تغییرات در مشخصات کاربر، گزینه‌های زیر را انتخاب فرمایید:",
+		u.TelegramUserID,
+		u.FirstName, u.LastName,
+		u.Username,
+		statusStr,
+		roleStr,
+		u.Segment,
+		phoneStr,
+		formatNumber(balIRT),
+		inviteCodeStr, invitedByStr,
+		u.CreatedAt.Format("2006-01-02 15:04"),
+	)
+
+	// Block toggle button
+	var blockBtn telego.InlineKeyboardButton
+	if u.Blocked {
+		blockBtn = tu.InlineKeyboardButton("🟢 رفع مسدودیت (Unblock)").WithCallbackData(fmt.Sprintf("admin:uset:block:%d:0", targetUserID))
+	} else {
+		blockBtn = tu.InlineKeyboardButton("⛔ مسدود کردن (Block)").WithCallbackData(fmt.Sprintf("admin:uset:block:%d:1", targetUserID))
+	}
+
+	// Role toggle button
+	var roleBtn telego.InlineKeyboardButton
+	if u.Role == user.RoleAdmin {
+		roleBtn = tu.InlineKeyboardButton("👤 تنزل به کاربر عادی").WithCallbackData(fmt.Sprintf("admin:uset:role:%d:user", targetUserID))
+	} else {
+		roleBtn = tu.InlineKeyboardButton("🛡️ ارتقا به مدیر (Admin)").WithCallbackData(fmt.Sprintf("admin:uset:role:%d:admin", targetUserID))
+	}
+
+	rows := [][]telego.InlineKeyboardButton{
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🏷️ تغییر سطح کاربری (Segment)").WithCallbackData(fmt.Sprintf("admin:uset:seg:%d", targetUserID)),
+			tu.InlineKeyboardButton("💳 مدیریت کیف پول").WithCallbackData(fmt.Sprintf("admin:wview:%d", targetUserID)),
+		),
+		tu.InlineKeyboardRow(
+			blockBtn,
+			roleBtn,
+		),
+	}
+
+	if u.IsPhoneVerified() {
+		rows = append(rows, tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("📱 ریست تایید شماره موبایل").WithCallbackData(fmt.Sprintf("admin:uset:reset_phone:%d", targetUserID)),
+		))
+	}
+
+	rows = append(rows, tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("« بازگشت به لیست کاربران").WithCallbackData("admin:users"),
+	))
+
+	markup := tu.InlineKeyboard(rows...)
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) sendAdminUserSegmentMenu(ctx context.Context, chatID telego.ChatID, targetUserID int64) error {
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		return nil
+	}
+
+	text := fmt.Sprintf(
+		"🏷️ <b>تغییر سطح کاربری (Segment)</b>\n\n"+
+			"• کاربر: <b>%s</b> (<code>%d</code>)\n"+
+			"• سطح فعلی: <code>%s</code>\n\n"+
+			"سطح جدید کاربری را انتخاب کنید:\n"+
+			"• <b>NEW:</b> کارمزد پایه ۱۰٪ (کاربران جدید)\n"+
+			"• <b>CUSTOMER:</b> کارمزد ویژه ۳٪ (مشتریان عادی)\n"+
+			"• <b>LOYAL:</b> کارمزد وفادار ۱٪ (مشتریان برتر)",
+		u.FirstName, u.TelegramUserID, u.Segment,
+	)
+
+	markup := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🥉 NEW (۱۰٪)").WithCallbackData(fmt.Sprintf("admin:uset:set_seg:%d:NEW", targetUserID)),
+			tu.InlineKeyboardButton("🥈 CUSTOMER (۳٪)").WithCallbackData(fmt.Sprintf("admin:uset:set_seg:%d:CUSTOMER", targetUserID)),
+			tu.InlineKeyboardButton("🥇 LOYAL (۱٪)").WithCallbackData(fmt.Sprintf("admin:uset:set_seg:%d:LOYAL", targetUserID)),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("« بازگشت به پرونده کاربر").WithCallbackData(fmt.Sprintf("admin:uview:%d", targetUserID)),
+		),
+	)
+
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) handleAdminUserSetSegment(ctx context.Context, cb *telego.CallbackQuery, chatID telego.ChatID, targetUserID int64, segStr string) error {
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		return nil
+	}
+
+	var seg fee.Segment
+	switch segStr {
+	case "CUSTOMER":
+		seg = fee.SegmentCustomer
+	case "LOYAL":
+		seg = fee.SegmentLoyal
+	default:
+		seg = fee.SegmentNew
+	}
+
+	now := time.Now().UTC()
+	u.SetSegment(seg, now)
+	if err := s.store.Users().Save(ctx, u); err != nil {
+		return err
+	}
+
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("سطح کاربر به %s تغییر یافت.", seg)))
+	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
+}
+
+func (s *Service) handleAdminUserSetBlock(ctx context.Context, cb *telego.CallbackQuery, chatID telego.ChatID, targetUserID int64, blocked bool) error {
+	if targetUserID == s.cfg.AdminTelegramID {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ امکان مسدود کردن مدیر اصلی سیستم وجود ندارد.").WithShowAlert())
+		return nil
+	}
+
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	u.SetBlocked(blocked, now)
+	if err := s.store.Users().Save(ctx, u); err != nil {
+		return err
+	}
+
+	var toast string
+	if blocked {
+		toast = "کاربر مسدود شد."
+	} else {
+		toast = "مسدودیت کاربر لغو شد."
+	}
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(toast))
+	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
+}
+
+func (s *Service) handleAdminUserSetRole(ctx context.Context, cb *telego.CallbackQuery, chatID telego.ChatID, targetUserID int64, roleStr string) error {
+	if targetUserID == s.cfg.AdminTelegramID && roleStr != "admin" {
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ امکان تنزل مقام مدیر اصلی سیستم وجود ندارد.").WithShowAlert())
+		return nil
+	}
+
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		return nil
+	}
+
+	role := user.RoleUser
+	if roleStr == "admin" {
+		role = user.RoleAdmin
+	}
+
+	now := time.Now().UTC()
+	u.SetRole(role, now)
+	if err := s.store.Users().Save(ctx, u); err != nil {
+		return err
+	}
+
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("نقش کاربر به %s تغییر یافت.", role)))
+	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
+}
+
+func (s *Service) handleAdminUserResetPhone(ctx context.Context, cb *telego.CallbackQuery, chatID telego.ChatID, targetUserID int64) error {
+	u, err := s.store.Users().GetByID(ctx, targetUserID)
+	if err != nil || u == nil {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	u.ResetPhone(now)
+	if err := s.store.Users().Save(ctx, u); err != nil {
+		return err
+	}
+
+	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("تایید شماره همراه کاربر ریست شد."))
+	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
+}
+
+func (s *Service) handleAdminUserCommand(ctx context.Context, chatID telego.ChatID, text string) error {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		return s.sendAdminUsersList(ctx, chatID)
+	}
+
+	targetUID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ شناسه کاربری نامعتبر است. فرمت صحیح: <code>/user 12345678</code>").WithParseMode(telego.ModeHTML))
+		return nil
+	}
+
+	return s.sendAdminUserDetailView(ctx, chatID, targetUID)
 }
