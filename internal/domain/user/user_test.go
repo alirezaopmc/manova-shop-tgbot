@@ -69,3 +69,53 @@ func TestUserPhoneVerification(t *testing.T) {
 		t.Fatalf("expected SegmentNew default")
 	}
 }
+
+func TestUserSettings(t *testing.T) {
+	now := time.Now()
+	u := New(99999, "bob", "Bob", "Smith", RoleUser, now)
+
+	// Test Blocked
+	if u.Blocked {
+		t.Fatalf("new user should not be blocked")
+	}
+	u.SetBlocked(true, now)
+	if !u.Blocked {
+		t.Fatalf("expected user to be blocked")
+	}
+	u.SetBlocked(false, now)
+	if u.Blocked {
+		t.Fatalf("expected user to be unblocked")
+	}
+
+	// Test Segment
+	u.SetSegment(fee.SegmentCustomer, now)
+	if u.Segment != fee.SegmentCustomer {
+		t.Fatalf("expected SegmentCustomer, got %v", u.Segment)
+	}
+	u.SetSegment(fee.SegmentLoyal, now)
+	if u.Segment != fee.SegmentLoyal {
+		t.Fatalf("expected SegmentLoyal, got %v", u.Segment)
+	}
+
+	// Test Role
+	u.SetRole(RoleAdmin, now)
+	if u.Role != RoleAdmin {
+		t.Fatalf("expected RoleAdmin, got %v", u.Role)
+	}
+	u.SetRole(RoleUser, now)
+	if u.Role != RoleUser {
+		t.Fatalf("expected RoleUser, got %v", u.Role)
+	}
+
+	// Test ResetPhone
+	phone := "+989123456789"
+	hash := "some-hash"
+	_ = u.SetVerifiedPhone(phone, hash, now)
+	if !u.IsPhoneVerified() {
+		t.Fatalf("expected phone to be verified")
+	}
+	u.ResetPhone(now)
+	if u.IsPhoneVerified() || u.PhoneE164 != nil || u.PhoneHash != nil {
+		t.Fatalf("expected phone verification to be cleared after ResetPhone")
+	}
+}
