@@ -37,7 +37,9 @@ type Config struct {
 	RateSpreadIRTPerUSD       int64
 	RequoteThresholdIRTPerUSD int64
 	RateMaxAgeHours           int
+	RatePollIntervalSeconds   int
 	SwapWalletAPIURL          string
+	WallexAPIURL              string
 
 	// Limits & Receipts
 	ReceiptMinIRR      int64
@@ -106,7 +108,9 @@ func LoadFromEnv() (*Config, error) {
 		RateSpreadIRTPerUSD:       getEnvInt64("RATE_SPREAD_IRT_PER_USD", 5000),
 		RequoteThresholdIRTPerUSD: getEnvInt64("REQUOTE_THRESHOLD_IRT_PER_USD", 5000),
 		RateMaxAgeHours:           getEnvInt("RATE_MAX_AGE_HOURS", 6),
-		SwapWalletAPIURL:          getEnvString("SWAPWALLET_API_URL", "https://api.swapwallet.io"),
+		RatePollIntervalSeconds:   getEnvInt("RATE_POLL_INTERVAL_SECONDS", 300),
+		SwapWalletAPIURL:          getEnvString("SWAPWALLET_API_URL", "https://swapwallet.app/api/v1/market/prices?pair=USDT/IRT"),
+		WallexAPIURL:              getEnvString("WALLEX_API_URL", "https://api.wallex.ir/v1/markets"),
 
 		ReceiptMinIRR:      getEnvInt64("RECEIPT_MIN_IRR", 1000000),
 		ReceiptMaxIRR:      getEnvInt64("RECEIPT_MAX_IRR", 500000000),
