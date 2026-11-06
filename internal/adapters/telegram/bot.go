@@ -13,7 +13,9 @@ import (
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
 
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/hetzner"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
@@ -33,17 +35,32 @@ type Service struct {
 	bot           *telego.Bot
 	cfg           *config.Config
 	store         *memory.Store
+	provider      port.CloudProvider
 	botUsername   string
 	mu            sync.RWMutex
 	pendingTopups map[int64]*pendingTopup
+	buyDrafts     map[int64]*buyDraft
 }
 
-func NewService(bot *telego.Bot, cfg *config.Config, store *memory.Store) *Service {
+func NewService(bot *telego.Bot, cfg *config.Config, store *memory.Store, provider ...port.CloudProvider) *Service {
+	var prov port.CloudProvider
+	if len(provider) > 0 && provider[0] != nil {
+		prov = provider[0]
+	} else if cfg != nil {
+		prov = hetzner.NewClient(hetzner.Config{
+			Token: cfg.HCloudToken.Expose(),
+		})
+	} else {
+		prov = hetzner.NewClient(hetzner.Config{})
+	}
+
 	return &Service{
 		bot:           bot,
 		cfg:           cfg,
 		store:         store,
+		provider:      prov,
 		pendingTopups: make(map[int64]*pendingTopup),
+		buyDrafts:     make(map[int64]*buyDraft),
 	}
 }
 
@@ -67,6 +84,27 @@ func (s *Service) getPendingTopup(userID int64) int64 {
 		return 0
 	}
 	return p.AmountIRT
+}
+
+func (s *Service) sendMessage(ctx context.Context, p *telego.SendMessageParams) (*telego.Message, error) {
+	if s.bot == nil {
+		return &telego.Message{MessageID: 1}, nil
+	}
+	return s.bot.SendMessage(ctx, p)
+}
+
+func (s *Service) deleteMessage(ctx context.Context, p *telego.DeleteMessageParams) error {
+	if s.bot == nil {
+		return nil
+	}
+	return s.bot.DeleteMessage(ctx, p)
+}
+
+func (s *Service) answerCallbackQuery(ctx context.Context, p *telego.AnswerCallbackQueryParams) error {
+	if s.bot == nil {
+		return nil
+	}
+	return s.bot.AnswerCallbackQuery(ctx, p)
 }
 
 func (s *Service) clearPendingTopup(userID int64) {
@@ -192,7 +230,35 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 		return s.sendAccessDenied(ctx, chatID)
 	}
 
-	// 6. Handle topup amount input (e.g. user typed "500000" or "۵۰۰,۰۰۰ تومان")
+	// 6. Handle active buy wizard awaiting step (e.g. submitting SSH Public Key)
+	if draft := s.getBuyDraft(userID); draft != nil && draft.Awaiting == "ssh_key" {
+		cleanedKey, err := validateSSHPublicKey(text)
+		if err != nil {
+			msgText := "❌ <b>فرمت کلید SSH معتبر نیست!</b>\n\n" +
+				"لطفاً یک کلید عمومی استاندارد OpenSSH ارسال فرمایید (معمولاً با <code>ssh-ed25519</code> یا <code>ssh-rsa</code> شروع می‌شود).\n\n" +
+				"نمونه فرمت صحیح:\n" +
+				"<code>ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host</code>"
+			markup := tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("🔑 استفاده از کلمه عبور روت به جای SSH").WithCallbackData(fmt.Sprintf("buy:acc_pwd:%s:%s:%s", draft.PlanID, draft.Location, draft.OSImage)),
+				),
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("❌ انصراف از خرید").WithCallbackData("buy:cancel"),
+				),
+			)
+			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, msgText).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+			return nil
+		}
+
+		draft.SSHKey = cleanedKey
+		draft.AccessMode = "ssh"
+		draft.Awaiting = ""
+		s.setBuyDraft(userID, draft)
+
+		return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
+	}
+
+	// 7. Handle topup amount input (e.g. user typed "500000" or "۵۰۰,۰۰۰ تومان")
 	if amt, err := parseAmountIRT(text); err == nil && amt >= 10_000 && amt <= 500_000_000 {
 		s.setPendingTopup(userID, amt)
 		return s.sendTopupPaymentDetails(ctx, chatID, amt)
@@ -314,12 +380,82 @@ func (s *Service) handleCallback(ctx context.Context, cb *telego.CallbackQuery) 
 		return s.sendUserSettings(ctx, chatID, usr)
 	case data == "menu:catalog":
 		return s.sendCatalog(ctx, chatID)
+	case data == "menu:servers":
+		return s.sendUserServersList(ctx, chatID, userID)
 	case data == "menu:wallet":
 		return s.sendWallet(ctx, chatID, userID)
 	case data == "menu:phone":
 		return s.sendPhonePrompt(ctx, chatID)
 	case data == "menu:support":
 		return s.sendSupport(ctx, chatID)
+	case data == "buy:cancel":
+		s.clearBuyDraft(userID)
+		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("خرید لغو شد."))
+		return s.sendMainMenu(ctx, chatID, usr)
+	case strings.HasPrefix(data, "plan:buy:"):
+		itemID := strings.TrimPrefix(data, "plan:buy:")
+		return s.sendBuyStep1Location(ctx, chatID, userID, itemID)
+	case strings.HasPrefix(data, "buy:loc:"):
+		parts := strings.Split(data, ":")
+		if len(parts) >= 4 {
+			return s.sendBuyStep2Distro(ctx, chatID, userID, parts[2], parts[3])
+		}
+	case strings.HasPrefix(data, "buy:os_d:"):
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			return s.sendBuyStep2Version(ctx, chatID, userID, parts[2], parts[3], parts[4])
+		}
+	case strings.HasPrefix(data, "buy:os_v:"):
+		parts := strings.Split(data, ":")
+		if len(parts) >= 6 {
+			return s.sendBuyStep3Access(ctx, chatID, userID, parts[2], parts[3], parts[4], parts[5])
+		}
+	case strings.HasPrefix(data, "buy:acc_pwd:"):
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			draft := s.getBuyDraft(userID)
+			if draft == nil {
+				draft = &buyDraft{PlanID: parts[2], Location: parts[3], OSImage: parts[4], CreatedAt: time.Now().UTC()}
+			}
+			draft.AccessMode = "pwd"
+			draft.Awaiting = ""
+			s.setBuyDraft(userID, draft)
+			return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
+		}
+	case strings.HasPrefix(data, "buy:acc_ssh_prompt:"):
+		parts := strings.Split(data, ":")
+		if len(parts) >= 5 {
+			return s.sendBuyStep3SSHPrompt(ctx, chatID, userID, parts[2], parts[3], parts[4])
+		}
+	case strings.HasPrefix(data, "buy:exec:"):
+		parts := strings.Split(data, ":")
+		if len(parts) >= 6 {
+			return s.handleBuyExecute(ctx, chatID, userID, parts[2], parts[3], parts[4], parts[5])
+		}
+	case strings.HasPrefix(data, "srv:manage:"):
+		resID := strings.TrimPrefix(data, "srv:manage:")
+		return s.sendServerManagementView(ctx, chatID, resID, userID)
+	case strings.HasPrefix(data, "srv:act:poweron:"):
+		resID := strings.TrimPrefix(data, "srv:act:poweron:")
+		return s.handleServerPowerOn(ctx, cb, resID, userID)
+	case strings.HasPrefix(data, "srv:act:poweroff:"):
+		resID := strings.TrimPrefix(data, "srv:act:poweroff:")
+		return s.handleServerPowerOff(ctx, cb, resID, userID)
+	case strings.HasPrefix(data, "srv:act:reboot:"):
+		resID := strings.TrimPrefix(data, "srv:act:reboot:")
+		return s.handleServerReboot(ctx, cb, resID, userID)
+	case strings.HasPrefix(data, "srv:act:reset_pwd:"):
+		resID := strings.TrimPrefix(data, "srv:act:reset_pwd:")
+		return s.handleServerResetPassword(ctx, cb, resID, userID)
+	case strings.HasPrefix(data, "srv:act:rescue:"):
+		resID := strings.TrimPrefix(data, "srv:act:rescue:")
+		return s.handleServerRescue(ctx, cb, resID, userID)
+	case strings.HasPrefix(data, "srv:act:delete_prompt:"):
+		resID := strings.TrimPrefix(data, "srv:act:delete_prompt:")
+		return s.handleServerDeletePrompt(ctx, chatID, resID, userID)
+	case strings.HasPrefix(data, "srv:act:delete_confirm:"):
+		resID := strings.TrimPrefix(data, "srv:act:delete_confirm:")
+		return s.handleServerDeleteConfirm(ctx, cb, resID, userID)
 	case data == "admin:home":
 		if usr.Role != user.RoleAdmin {
 			return nil
@@ -482,6 +618,7 @@ func (s *Service) sendMainMenu(ctx context.Context, chatID telego.ChatID, usr *u
 	rows := [][]telego.InlineKeyboardButton{
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("🛒 خرید سرور ابری Hetzner").WithCallbackData("menu:catalog"),
+			tu.InlineKeyboardButton("🖥️ سرورهای من").WithCallbackData("menu:servers"),
 		),
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("💰 کیف پول و موجودی").WithCallbackData("menu:wallet"),
@@ -668,6 +805,9 @@ func (s *Service) sendServerDetail(ctx context.Context, chatID telego.ChatID, it
 	)
 
 	markup := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🚀 خرید و راه‌اندازی این سرور").WithCallbackData(fmt.Sprintf("plan:buy:%s", it.ID)),
+		),
 		tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("« بازگشت به لیست پلن‌ها").WithCallbackData("menu:catalog"),
 		),
