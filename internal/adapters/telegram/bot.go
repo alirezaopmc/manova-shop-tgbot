@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -22,20 +23,56 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
 )
 
+type pendingTopup struct {
+	AmountIRT int64
+	CreatedAt time.Time
+}
+
 // Service runs the Telegram bot adapter over long polling.
 type Service struct {
-	bot         *telego.Bot
-	cfg         *config.Config
-	store       *memory.Store
-	botUsername string
+	bot           *telego.Bot
+	cfg           *config.Config
+	store         *memory.Store
+	botUsername   string
+	mu            sync.RWMutex
+	pendingTopups map[int64]*pendingTopup
 }
 
 func NewService(bot *telego.Bot, cfg *config.Config, store *memory.Store) *Service {
 	return &Service{
-		bot:   bot,
-		cfg:   cfg,
-		store: store,
+		bot:           bot,
+		cfg:           cfg,
+		store:         store,
+		pendingTopups: make(map[int64]*pendingTopup),
 	}
+}
+
+func (s *Service) setPendingTopup(userID int64, amount int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingTopups[userID] = &pendingTopup{
+		AmountIRT: amount,
+		CreatedAt: time.Now().UTC(),
+	}
+}
+
+func (s *Service) getPendingTopup(userID int64) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.pendingTopups[userID]
+	if !ok || p == nil {
+		return 0
+	}
+	if time.Since(p.CreatedAt) > 2*time.Hour {
+		return 0
+	}
+	return p.AmountIRT
+}
+
+func (s *Service) clearPendingTopup(userID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pendingTopups, userID)
 }
 
 // Start initiates long polling and handles incoming updates until ctx is cancelled.
@@ -153,6 +190,12 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 	// Unenrolled user attempting other commands
 	if usr == nil {
 		return s.sendAccessDenied(ctx, chatID)
+	}
+
+	// 6. Handle topup amount input (e.g. user typed "500000" or "۵۰۰,۰۰۰ تومان")
+	if amt, err := parseAmountIRT(text); err == nil && amt >= 10_000 && amt <= 500_000_000 {
+		s.setPendingTopup(userID, amt)
+		return s.sendTopupPaymentDetails(ctx, chatID, amt)
 	}
 
 	// Default: show main menu
@@ -351,7 +394,12 @@ func (s *Service) handleCallback(ctx context.Context, cb *telego.CallbackQuery) 
 		itemID := strings.TrimPrefix(data, "plan:view:")
 		return s.sendServerDetail(ctx, chatID, itemID)
 	case data == "wallet:topup_info":
-		return s.sendTopupInfo(ctx, chatID)
+		return s.sendTopupAmountPrompt(ctx, chatID)
+	case strings.HasPrefix(data, "wallet:topup:amt:"):
+		amtStr := strings.TrimPrefix(data, "wallet:topup:amt:")
+		amt, _ := strconv.ParseInt(amtStr, 10, 64)
+		s.setPendingTopup(userID, amt)
+		return s.sendTopupPaymentDetails(ctx, chatID, amt)
 	case data == "admin:wallets":
 		if usr.Role != user.RoleAdmin {
 			return nil
@@ -408,6 +456,12 @@ func (s *Service) handleCallback(ctx context.Context, cb *telego.CallbackQuery) 
 		}
 		rcptID := strings.TrimPrefix(data, "admin:rcpt:rej:")
 		return s.handleReceiptRejection(ctx, cb, rcptID)
+	case strings.HasPrefix(data, "admin:rcpt:other:"):
+		if usr.Role != user.RoleAdmin {
+			return nil
+		}
+		rcptID := strings.TrimPrefix(data, "admin:rcpt:other:")
+		return s.sendAdminReceiptOtherAmounts(ctx, chatID, rcptID)
 	}
 
 	return nil
@@ -659,22 +713,54 @@ func (s *Service) sendWallet(ctx context.Context, chatID telego.ChatID, userID i
 }
 
 func (s *Service) sendTopupInfo(ctx context.Context, chatID telego.ChatID) error {
+	return s.sendTopupAmountPrompt(ctx, chatID)
+}
+
+func (s *Service) sendTopupAmountPrompt(ctx context.Context, chatID telego.ChatID) error {
+	text := "💳 <b>افزایش موجودی و شارژ کیف پول</b>\n\n" +
+		"لطفاً مبلغ مورد نظر خود برای شارژ را از گزینه‌های زیر انتخاب فرمایید، یا مبلغ دلخواه را به تومان در چت تایپ و ارسال نمایید:\n\n" +
+		"<i>(حداقل مبلغ شارژ: ۵۰,۰۰۰ تومان)</i>"
+
+	markup := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💰 ۱۰۰,۰۰۰ ت").WithCallbackData("wallet:topup:amt:100000"),
+			tu.InlineKeyboardButton("💰 ۲۵۰,۰۰۰ ت").WithCallbackData("wallet:topup:amt:250000"),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💰 ۵۰۰,۰۰۰ ت").WithCallbackData("wallet:topup:amt:500000"),
+			tu.InlineKeyboardButton("💰 ۱,۰۰۰,۰۰۰ ت").WithCallbackData("wallet:topup:amt:1000000"),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💰 ۲,۰۰۰,۰۰۰ ت").WithCallbackData("wallet:topup:amt:2000000"),
+			tu.InlineKeyboardButton("💰 ۵,۰۰۰,۰۰۰ ت").WithCallbackData("wallet:topup:amt:5000000"),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("« بازگشت به کیف پول").WithCallbackData("menu:wallet"),
+		),
+	)
+
+	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func (s *Service) sendTopupPaymentDetails(ctx context.Context, chatID telego.ChatID, amountIRT int64) error {
 	text := fmt.Sprintf(
 		"💳 <b>اطلاعات پرداخت جهت شارژ کیف پول</b>\n\n"+
-			"مبلغ مورد نظر خود را به شماره کارت زیر واریز فرمایید:\n\n"+
+			"• <b>مبلغ اعلام‌شده:</b> <code>%s تومان</code>\n"+
 			"• <b>شماره کارت:</b> <code>6037997512345678</code>\n"+
 			"• <b>بنام:</b> <b>%s</b>\n\n"+
-			"📸 <b>ارسال تصویر فیش (اسکرین‌شات):</b>\n"+
-			"پس از واریز، کافیست <b>تصویر فیش یا اسکرین‌شات رسید</b> را مستقیماً همین‌جا در ربات ارسال فرمایید.\n"+
-			"رسید شما به صورت خودکار برای مدیریت ارسال و پس از تایید، کیف پول شما شارژ خواهد شد.\n\n"+
-			"ارتباط با پشتیبانی: %s",
+			"📸 <b>ارسال فیش واریز:</b>\n"+
+			"پس از انتقال مبلغ <b>%s تومان</b>، لطفاً تصویر فیش یا اسکرین‌شات رسید را همین‌جا در چت ارسال فرمایید تا کیف پول شما تایید و شارژ گردد.\n\n"+
+			"<i>(اگر مبلغ واریزی شما متفاوت است، می‌توانید مبلغ جدید را تایپ و ارسال فرمایید)</i>",
+		formatNumber(amountIRT),
 		s.cfg.CardHolderName,
-		s.cfg.SupportHandle,
+		formatNumber(amountIRT),
 	)
 
 	markup := tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("« بازگشت به کیف پول").WithCallbackData("menu:wallet"),
+			tu.InlineKeyboardButton("✏️ تغییر مبلغ").WithCallbackData("wallet:topup_info"),
+			tu.InlineKeyboardButton("« انصراف و بازگشت").WithCallbackData("menu:wallet"),
 		),
 	)
 
@@ -913,6 +999,14 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 		return nil
 	}
 
+	// 1. Determine declared amount (from pending topup session or caption)
+	amountIRT := s.getPendingTopup(userID)
+	if amountIRT == 0 && msg.Caption != "" {
+		if captionAmt, err := parseAmountIRT(msg.Caption); err == nil && captionAmt > 0 {
+			amountIRT = captionAmt
+		}
+	}
+
 	rcptID := fmt.Sprintf("rcpt-%d", time.Now().UnixNano()/1e6)
 	now := time.Now().UTC()
 
@@ -920,20 +1014,34 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 		ID:        rcptID,
 		UserID:    userID,
 		Purpose:   receipt.PurposeWalletTopup,
+		AmountIRT: pricing.IRT(amountIRT),
 		ImageRef:  fileID,
 		Status:    receipt.StatusPendingReview,
 		CreatedAt: now,
 	}
+	if msg.Caption != "" {
+		rcp.Note = &msg.Caption
+	}
 
 	_ = s.store.Receipts().Save(ctx, rcp)
+	s.clearPendingTopup(userID)
 
 	// Acknowledge user
+	var amtDesc string
+	if amountIRT > 0 {
+		amtDesc = fmt.Sprintf("• <b>مبلغ اعلام‌شده:</b> <code>%s تومان</code>\n", formatNumber(amountIRT))
+	} else {
+		amtDesc = "• <i>(مبلغی از پیش انتخاب نشده است)</i>\n"
+	}
+
 	ackText := fmt.Sprintf(
 		"✅ <b>رسید پرداخت شما دریافت شد!</b>\n\n"+
 			"• <b>شناسه پیگیری:</b> <code>%s</code>\n"+
+			"%s"+
 			"• <b>وضعیت:</b> در انتظار بررسی مدیریت ⏳\n\n"+
-			"رسید شما جهت بررسی و تایید برای مدیریت ارسال گردید. به محض تایید، کیف پول شما به صورت خودکار شارژ خواهد شد.",
+			"رسید شما جهت بررسی و تایید برای مدیریت ارسال گردید. به محض تایید، موجودی کیف پول شما شارژ خواهد شد.",
 		rcptID,
+		amtDesc,
 	)
 	_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, ackText).WithParseMode(telego.ModeHTML))
 
@@ -945,36 +1053,53 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 				"• <b>کاربر:</b> <code>%d</code> (@%s)\n"+
 				"• <b>نام:</b> %s %s\n"+
 				"• <b>شناسه رسید:</b> <code>%s</code>\n"+
-				"• <b>زمان:</b> <code>%s</code>\n\n"+
-				"مبلغ واریزی را جهت تایید و شارژ خودکار انتخاب فرمایید:",
+				"• 💰 <b>مبلغ اعلام‌شده توسط کاربر:</b> <b>%s</b>\n"+
+				"• <b>زمان:</b> <code>%s</code>",
 			userID,
 			msg.From.Username,
 			msg.From.FirstName,
 			msg.From.LastName,
 			rcptID,
+			amtLabel(amountIRT),
 			now.Format("2006-01-02 15:04:05 UTC"),
 		)
 		if msg.Caption != "" {
-			caption += fmt.Sprintf("\n• <b>توضیحات کاربر:</b> <i>%s</i>\n", msg.Caption)
+			caption += fmt.Sprintf("\n• <b>توضیحات کاربر:</b> <i>%s</i>", msg.Caption)
 		}
 
-		adminMarkup := tu.InlineKeyboard(
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("💰 ۱۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:100000", rcptID)),
-				tu.InlineKeyboardButton("💰 ۲۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:250000", rcptID)),
-			),
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("💰 ۵۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:500000", rcptID)),
-				tu.InlineKeyboardButton("💰 ۱,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:1000000", rcptID)),
-			),
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("💰 ۲,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:2000000", rcptID)),
-				tu.InlineKeyboardButton("💰 ۵,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:5000000", rcptID)),
-			),
-			tu.InlineKeyboardRow(
-				tu.InlineKeyboardButton("❌ رد رسید (Reject)").WithCallbackData(fmt.Sprintf("admin:rcpt:rej:%s", rcptID)),
-			),
-		)
+		var adminMarkup *telego.InlineKeyboardMarkup
+		if amountIRT > 0 {
+			adminMarkup = tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton(fmt.Sprintf("✅ تایید و شارژ %s ت", formatNumber(amountIRT))).
+						WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:%d", rcptID, amountIRT)),
+				),
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("❌ رد رسید (Reject)").
+						WithCallbackData(fmt.Sprintf("admin:rcpt:rej:%s", rcptID)),
+					tu.InlineKeyboardButton("✏️ تایید با مبلغ دیگر").
+						WithCallbackData(fmt.Sprintf("admin:rcpt:other:%s", rcptID)),
+				),
+			)
+		} else {
+			adminMarkup = tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("💰 ۱۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:100000", rcptID)),
+					tu.InlineKeyboardButton("💰 ۲۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:250000", rcptID)),
+				),
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("💰 ۵۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:500000", rcptID)),
+					tu.InlineKeyboardButton("💰 ۱,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:1000000", rcptID)),
+				),
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("💰 ۲,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:2000000", rcptID)),
+					tu.InlineKeyboardButton("💰 ۵,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:5000000", rcptID)),
+				),
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("❌ رد رسید (Reject)").WithCallbackData(fmt.Sprintf("admin:rcpt:rej:%s", rcptID)),
+				),
+			)
+		}
 
 		if len(msg.Photo) > 0 {
 			_, _ = s.bot.SendPhoto(ctx, tu.Photo(adminChatID, tu.FileFromID(fileID)).
@@ -1120,6 +1245,88 @@ func (s *Service) handleReceiptRejection(ctx context.Context, cb *telego.Callbac
 
 	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("رسید رد شد."))
 	return nil
+}
+
+func (s *Service) sendAdminReceiptOtherAmounts(ctx context.Context, chatID telego.ChatID, rcptID string) error {
+	rcp, err := s.store.Receipts().GetByID(ctx, rcptID)
+	if err != nil || rcp == nil {
+		return nil
+	}
+
+	text := fmt.Sprintf(
+		"✏️ <b>انتخاب مبلغ برای تایید رسید %s</b>\n\n"+
+			"مبلغ مورد نظر جهت شارژ را انتخاب فرمایید:",
+		rcptID,
+	)
+
+	markup := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💰 ۱۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:100000", rcptID)),
+			tu.InlineKeyboardButton("💰 ۲۵۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:250000", rcptID)),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💰 ۵۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:500000", rcptID)),
+			tu.InlineKeyboardButton("💰 ۱,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:1000000", rcptID)),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💰 ۲,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:2000000", rcptID)),
+			tu.InlineKeyboardButton("💰 ۵,۰۰۰,۰۰۰ ت").WithCallbackData(fmt.Sprintf("admin:rcpt:app:%s:5000000", rcptID)),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("❌ رد رسید").WithCallbackData(fmt.Sprintf("admin:rcpt:rej:%s", rcptID)),
+		),
+	)
+
+	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	return err
+}
+
+func amtLabel(amt int64) string {
+	if amt <= 0 {
+		return "اعلام نشده"
+	}
+	return fmt.Sprintf("%s تومان", formatNumber(amt))
+}
+
+// parseAmountIRT parses a Persian or English number representing an amount in IRT.
+func parseAmountIRT(raw string) (int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, fmt.Errorf("empty input")
+	}
+
+	var multiplier int64 = 1
+	lower := strings.ToLower(s)
+	if strings.HasSuffix(lower, "k") || strings.HasSuffix(lower, "هزار") {
+		multiplier = 1_000
+	} else if strings.HasSuffix(lower, "m") || strings.HasSuffix(lower, "میلیون") {
+		multiplier = 1_000_000
+	}
+
+	var sb strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= '۰' && r <= '۹':
+			sb.WriteRune('0' + (r - '۰'))
+		case r >= '٠' && r <= '٩':
+			sb.WriteRune('0' + (r - '٠'))
+		case r >= '0' && r <= '9':
+			sb.WriteRune(r)
+		}
+	}
+
+	cleaned := sb.String()
+	if cleaned == "" {
+		return 0, fmt.Errorf("no digits found")
+	}
+
+	val, err := strconv.ParseInt(cleaned, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	total := val * multiplier
+	return total, nil
 }
 
 func (s *Service) sendAdminWalletsList(ctx context.Context, chatID telego.ChatID) error {
