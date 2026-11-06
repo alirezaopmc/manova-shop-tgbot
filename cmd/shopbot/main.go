@@ -12,6 +12,7 @@ import (
 	"github.com/mymmrac/telego"
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/fxrate"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/hetzner"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/telegram"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
@@ -71,7 +72,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	service := telegram.NewService(bot, cfg, store)
+	hetznerClient := hetzner.NewClient(hetzner.Config{
+		Token:  cfg.HCloudToken.Expose(),
+		Logger: logger,
+	})
+
+	service := telegram.NewService(bot, cfg, store, hetznerClient)
 
 	go func() {
 		if err := service.Start(ctx); err != nil && err != context.Canceled {

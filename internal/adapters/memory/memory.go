@@ -511,6 +511,26 @@ func (r *billingRepo) ListActiveResources(_ context.Context) ([]billing.Provisio
 	return out, nil
 }
 
+func (r *billingRepo) ListUserResources(_ context.Context, userID int64) ([]billing.ProvisionedResource, error) {
+	r.s.mu.RLock()
+	defer r.s.mu.RUnlock()
+	var out []billing.ProvisionedResource
+	for _, res := range r.s.resources {
+		if res.UserID == userID && res.Status == billing.ResourceStatusActive {
+			out = append(out, *res)
+		}
+	}
+	return out, nil
+}
+
+func (r *billingRepo) SaveResource(_ context.Context, res *billing.ProvisionedResource) error {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	cp := *res
+	r.s.resources[res.ID] = &cp
+	return nil
+}
+
 func (r *billingRepo) SaveMinutePosting(_ context.Context, p *billing.MinutePosting) error {
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()

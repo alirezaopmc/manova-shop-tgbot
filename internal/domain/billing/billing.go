@@ -47,12 +47,20 @@ type MinutePosting struct {
 // ProvisionedResource represents a billed Hetzner Cloud server.
 type ProvisionedResource struct {
 	ID                  string
+	UserID              int64
+	ServerName          string
 	OrderItemID         string
 	ExternalID          string
 	Status              ResourceStatus
 	PowerState          PowerState
 	HourlyPriceUSD      pricing.MicroUSD
 	MonthlyCapUSD       pricing.MicroUSD
+	IPv4Address         string
+	IPv6Address         string
+	Location            string
+	ImageName           string
+	RootPassword        string // Stored when password access mode is used
+	SSHKey              string // OpenSSH public key if SSH access mode is used
 	BillingStartAt      time.Time
 	BillingEndAt        *time.Time
 	PostedThroughMinute int64

@@ -36,6 +36,9 @@ type ProviderCreateResult struct {
 	ExternalID   string
 	ActionID     int64
 	RootPassword string // returned when no SSH key is supplied
+	IPv4Address  string
+	IPv6Address  string
+	Status       string
 }
 
 // CloudProvider abstracts Hetzner Cloud infrastructure operations.
@@ -46,6 +49,7 @@ type CloudProvider interface {
 	PowerOn(ctx context.Context, externalID string) error
 	PowerOff(ctx context.Context, externalID string) error
 	Shutdown(ctx context.Context, externalID string) error
+	Reboot(ctx context.Context, externalID string) error
 	ResetPassword(ctx context.Context, externalID string) (string, error)
 	EnableRescue(ctx context.Context, externalID string) (string, error)
 	DisableRescue(ctx context.Context, externalID string) error
@@ -127,6 +131,8 @@ type OSCatalogRepository interface {
 type BillingRepository interface {
 	GetResource(ctx context.Context, resourceID string) (*billing.ProvisionedResource, error)
 	ListActiveResources(ctx context.Context) ([]billing.ProvisionedResource, error)
+	ListUserResources(ctx context.Context, userID int64) ([]billing.ProvisionedResource, error)
+	SaveResource(ctx context.Context, r *billing.ProvisionedResource) error
 	SaveMinutePosting(ctx context.Context, p *billing.MinutePosting) error
 	UpdateResourceBillingEnd(ctx context.Context, resourceID string, billingEnd time.Time, status billing.ResourceStatus) error
 }
