@@ -78,6 +78,9 @@ func (s *Service) HandleUpdate(ctx context.Context, u telego.Update) error {
 	if u.InlineQuery != nil {
 		return s.handleInlineQuery(ctx, u.InlineQuery)
 	}
+	if u.ChosenInlineResult != nil {
+		return s.handleChosenInlineResult(ctx, u.ChosenInlineResult)
+	}
 	return nil
 }
 
@@ -535,7 +538,7 @@ func (s *Service) handleGenerateInvite(ctx context.Context, chatID telego.ChatID
 			tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink),
 		),
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("📤 ارسال اینلاین به چت‌ها").WithSwitchInlineQuery(""),
+			tu.InlineKeyboardButton("📤 ارسال اینلاین به چت‌ها").WithSwitchInlineQuery(inv.Code),
 			tu.InlineKeyboardButton("↗️ اشتراک سریع").WithURL(shareURL),
 		),
 		tu.InlineKeyboardRow(
@@ -772,7 +775,7 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 		return s.bot.AnswerInlineQuery(ctx, &telego.AnswerInlineQueryParams{
 			InlineQueryID: q.ID,
 			Results:       []telego.InlineQueryResult{article},
-			CacheTime:     0,
+			CacheTime:     1,
 			IsPersonal:    true,
 		})
 	}
@@ -785,7 +788,38 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 
 	var results []telego.InlineQueryResult
 
-	// 1. Single-use invitation (Default, strict security: 1 user only)
+	// 1. If query references an existing invite code, provide that exact invite card
+	rawQuery := strings.TrimSpace(q.Query)
+	cleanedQuery := invite.CleanCode(rawQuery)
+	if cleanedQuery != "" {
+		if existingInv, err := s.store.Invites().GetByCode(ctx, cleanedQuery); err == nil && existingInv != nil && existingInv.IsActive {
+			usesDesc := "نامحدود"
+			if existingInv.MaxUses > 0 {
+				usesDesc = fmt.Sprintf("%d کاربر", existingInv.MaxUses)
+			}
+			deepLink := fmt.Sprintf("https://t.me/%s?start=invite_%s", botUser, existingInv.Code)
+			text := "🛍️ <b>فروشگاه مانوا | Manova Shop</b>\n\n" +
+				"دعوت‌نامه اختصاصی ورود به فروشگاه سرورهای ابری"
+			markup := tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton("🛍️ ورود به فروشگاه").WithURL(deepLink),
+				),
+			)
+			results = append(results, &telego.InlineQueryResultArticle{
+				Type:        "article",
+				ID:          fmt.Sprintf("inv_exist_%s", existingInv.Code),
+				Title:       fmt.Sprintf("🎫 کارت دعوت اختصاصی (%s)", existingInv.Code),
+				Description: fmt.Sprintf("کد امنیتی: %s (ظرفیت: %s)", existingInv.Code, usesDesc),
+				InputMessageContent: &telego.InputTextMessageContent{
+					MessageText: text,
+					ParseMode:   telego.ModeHTML,
+				},
+				ReplyMarkup: markup,
+			})
+		}
+	}
+
+	// 2. Single-use invitation (Default, strict security: 1 user only)
 	inv1 := invite.New(senderID, 1, nil, now)
 	if err := s.store.Invites().Create(ctx, inv1); err == nil {
 		deepLink1 := fmt.Sprintf("https://t.me/%s?start=invite_%s", botUser, inv1.Code)
@@ -800,7 +834,7 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 			Type:        "article",
 			ID:          fmt.Sprintf("inv_1_%s", inv1.Code),
 			Title:       "🎫 کارت دعوت یک‌بار مصرف (تک‌کاربره)",
-			Description: fmt.Sprintf("کد اختصاصی: %s (ظرفیت ۱ نفر)", inv1.Code),
+			Description: fmt.Sprintf("کد جدید: %s (ظرفیت ۱ نفر)", inv1.Code),
 			InputMessageContent: &telego.InputTextMessageContent{
 				MessageText: text1,
 				ParseMode:   telego.ModeHTML,
@@ -809,7 +843,7 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 		})
 	}
 
-	// 2. 5-use invitation (For inviting small team)
+	// 3. 5-use invitation (For inviting small team)
 	inv5 := invite.New(senderID, 5, nil, now)
 	if err := s.store.Invites().Create(ctx, inv5); err == nil {
 		deepLink5 := fmt.Sprintf("https://t.me/%s?start=invite_%s", botUser, inv5.Code)
@@ -824,7 +858,7 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 			Type:        "article",
 			ID:          fmt.Sprintf("inv_5_%s", inv5.Code),
 			Title:       "🎫 کارت دعوت ۵ کاربره",
-			Description: fmt.Sprintf("کد اختصاصی: %s (ظرفیت ۵ نفر)", inv5.Code),
+			Description: fmt.Sprintf("کد جدید: %s (ظرفیت ۵ نفر)", inv5.Code),
 			InputMessageContent: &telego.InputTextMessageContent{
 				MessageText: text5,
 				ParseMode:   telego.ModeHTML,
@@ -833,12 +867,30 @@ func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) 
 		})
 	}
 
+	slog.Info("answered inline query",
+		"query_id", q.ID,
+		"from_id", senderID,
+		"query", q.Query,
+		"inv1", inv1.Code,
+		"cache_time", 1,
+	)
+
 	return s.bot.AnswerInlineQuery(ctx, &telego.AnswerInlineQueryParams{
 		InlineQueryID: q.ID,
 		Results:       results,
-		CacheTime:     0,
+		CacheTime:     1,
 		IsPersonal:    true,
 	})
+}
+
+func (s *Service) handleChosenInlineResult(_ context.Context, res *telego.ChosenInlineResult) error {
+	slog.Info("chosen inline result recorded",
+		"from_id", res.From.ID,
+		"result_id", res.ResultID,
+		"query", res.Query,
+		"inline_msg_id", res.InlineMessageID,
+	)
+	return nil
 }
 
 func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, usr *user.User) error {
