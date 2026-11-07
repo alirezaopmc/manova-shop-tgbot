@@ -18,7 +18,6 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/refund"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
 )
 
 var (
@@ -149,18 +148,6 @@ func (s *Store) Billing() port.BillingRepository     { return s.billing }
 func (s *Store) FxRates() port.FxRateSource          { return s.fxRates }
 
 // --- Sub-repository scaffolding stubs ---
-
-type walletRepo struct{ s *Store }
-
-func (r *walletRepo) GetByUserID(_ context.Context, _ int64) (*wallet.Wallet, error) {
-	return nil, ErrNotImplemented
-}
-func (r *walletRepo) RecordLedgerEntry(_ context.Context, _ *wallet.LedgerEntry) error {
-	return ErrNotImplemented
-}
-func (r *walletRepo) UpdateBalances(_ context.Context, _ *wallet.Wallet) error {
-	return ErrNotImplemented
-}
 
 type orderRepo struct{ s *Store }
 

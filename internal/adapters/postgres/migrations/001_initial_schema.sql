@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS shop.wallet_ledger (
 
 CREATE INDEX IF NOT EXISTS wallet_ledger_wallet_id_idx ON shop.wallet_ledger (wallet_id, created_at);
 CREATE INDEX IF NOT EXISTS wallet_ledger_ref_idx ON shop.wallet_ledger (ref_type, ref_id) WHERE ref_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_idempotency ON shop.wallet_ledger (ref_type, ref_id, kind, currency) WHERE ref_id != '';
 
 -- Trigger enforcing append-only immutability on wallet_ledger.
 -- +goose StatementBegin
@@ -303,6 +304,7 @@ ON CONFLICT (id) DO NOTHING;
 DROP TRIGGER IF EXISTS wallet_ledger_no_delete ON shop.wallet_ledger;
 DROP TRIGGER IF EXISTS wallet_ledger_no_update ON shop.wallet_ledger;
 DROP FUNCTION IF EXISTS shop.prevent_ledger_mutation();
+DROP INDEX IF EXISTS shop.uq_ledger_idempotency;
 
 DROP TABLE IF EXISTS shop.admin_actions;
 DROP TABLE IF EXISTS shop.conversation_states;

@@ -131,17 +131,6 @@ func TestSubRepositoryStubsReturnNotImplemented(t *testing.T) {
 	s := NewStore(nil)
 	ctx := context.Background()
 
-	// Wallets
-	if _, err := s.Wallets().GetByUserID(ctx, 1); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Wallets().GetByUserID, got %v", err)
-	}
-	if err := s.Wallets().RecordLedgerEntry(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Wallets().RecordLedgerEntry, got %v", err)
-	}
-	if err := s.Wallets().UpdateBalances(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Wallets().UpdateBalances, got %v", err)
-	}
-
 	// Orders
 	if _, err := s.Orders().GetByID(ctx, "ord"); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("expected ErrNotImplemented from Orders().GetByID, got %v", err)
