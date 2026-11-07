@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -27,11 +28,12 @@ type Config struct {
 	CardHolderName  string
 
 	// Database
-	DBHost    string
-	DBPort    int
-	DBUser    string
-	DBName    string
-	DBSSLMode string
+	DatabaseURL string
+	DBHost      string
+	DBPort      int
+	DBUser      string
+	DBName      string
+	DBSSLMode   string
 
 	// Pricing & FX
 	RateSpreadIRTPerUSD       int64
@@ -77,9 +79,45 @@ type Config struct {
 }
 
 // DatabaseDSN generates standard PostgreSQL connection string.
+// If DATABASE_URL is set, it takes precedence. Otherwise, it formats
+// a standard postgres URL: postgres://<user>:<password>@<host>:<port>/<dbname>?sslmode=<sslmode>.
 func (c *Config) DatabaseDSN() string {
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.DBHost, c.DBPort, c.DBUser, c.DBPassword.Expose(), c.DBName, c.DBSSLMode)
+	if c.DatabaseURL != "" {
+		return c.DatabaseURL
+	}
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		return dsn
+	}
+	host := c.DBHost
+	if host == "" {
+		host = "localhost"
+	}
+	port := c.DBPort
+	if port == 0 {
+		port = 5432
+	}
+	user := c.DBUser
+	if user == "" {
+		user = "shopbot"
+	}
+	dbname := c.DBName
+	if dbname == "" {
+		dbname = "shopbot"
+	}
+	sslMode := c.DBSSLMode
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(user, c.DBPassword.Expose()),
+		Host:   fmt.Sprintf("%s:%d", host, port),
+		Path:   dbname,
+	}
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // LoadFromEnv loads configuration from environment variables with sensible defaults.
@@ -99,11 +137,12 @@ func LoadFromEnv() (*Config, error) {
 		TotpIssuer:      getEnvString("TOTP_ISSUER", "shop_manovabot"),
 		CardHolderName:  getEnvString("CARD_HOLDER_NAME", "Alireza Jafartash"),
 
-		DBHost:    getEnvString("DATABASE_HOST", "localhost"),
-		DBPort:    getEnvInt("DATABASE_PORT", 5432),
-		DBUser:    getEnvString("DATABASE_USER", "shopbot"),
-		DBName:    getEnvString("DATABASE_NAME", "shopbot"),
-		DBSSLMode: getEnvString("DATABASE_SSLMODE", "disable"),
+		DatabaseURL: getEnvString("DATABASE_URL", ""),
+		DBHost:      getEnvString("DATABASE_HOST", ""),
+		DBPort:      getEnvInt("DATABASE_PORT", 5432),
+		DBUser:      getEnvString("DATABASE_USER", "shopbot"),
+		DBName:      getEnvString("DATABASE_NAME", "shopbot"),
+		DBSSLMode:   getEnvString("DATABASE_SSLMODE", "disable"),
 
 		RateSpreadIRTPerUSD:       getEnvInt64("RATE_SPREAD_IRT_PER_USD", 5000),
 		RequoteThresholdIRTPerUSD: getEnvInt64("REQUOTE_THRESHOLD_IRT_PER_USD", 5000),

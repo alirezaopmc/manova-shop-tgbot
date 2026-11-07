@@ -14,9 +14,17 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/fxrate"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/hetzner"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres/migrations"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/telegram"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
 )
+
+type botStore interface {
+	port.Store
+	fxrate.RateSetter
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -35,7 +43,39 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store := memory.NewStore()
+	var store botStore
+
+	if cfg.DatabaseURL == "" && cfg.DBHost == "" {
+		slog.Warn("DATABASE_HOST and DATABASE_URL not set; falling back to in-memory store for local dev")
+		store = memory.NewStore()
+	} else {
+		dsn := cfg.DatabaseDSN()
+		slog.Info("running embedded database migrations")
+		migrator, err := migrations.Open(dsn)
+		if err != nil {
+			slog.Error("failed to open database for migrations", "error", err)
+			os.Exit(1)
+		}
+		if err := migrator.Up(ctx); err != nil {
+			_ = migrator.Close()
+			slog.Error("failed to run database migrations", "error", err)
+			os.Exit(1)
+		}
+		if err := migrator.Close(); err != nil {
+			slog.Warn("failed to close migrator handle", "error", err)
+		}
+
+		slog.Info("initializing postgresql connection pool")
+		pool, err := postgres.NewPool(ctx, dsn)
+		if err != nil {
+			slog.Error("failed to initialize postgres pool", "error", err)
+			os.Exit(1)
+		}
+		defer pool.Close()
+
+		store = postgres.NewStore(pool)
+		slog.Info("postgresql store initialized successfully")
+	}
 
 	// Initialize live FX rate client & background poller (SwapWallet primary, Wallex fallback)
 	fxClient := fxrate.NewClient(fxrate.ClientConfig{

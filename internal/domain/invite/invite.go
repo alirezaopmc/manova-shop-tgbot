@@ -10,10 +10,11 @@ import (
 )
 
 var (
-	ErrInviteNotFound = errors.New("invite not found")
-	ErrInviteUsed     = errors.New("invite has reached its maximum uses or is inactive")
-	ErrInviteExpired  = errors.New("invite has expired")
-	ErrInviteSelf     = errors.New("cannot redeem your own invite")
+	ErrInviteNotFound    = errors.New("invite not found")
+	ErrInviteUsed        = errors.New("invite has reached its maximum uses or is inactive")
+	ErrInviteExpired     = errors.New("invite has expired")
+	ErrInviteSelf        = errors.New("cannot redeem your own invite")
+	ErrInviteAlreadyUsed = errors.New("invite already claimed by user")
 )
 
 // Invite models an onboarding token that permits users to join the bot.

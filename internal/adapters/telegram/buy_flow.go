@@ -2,8 +2,11 @@ package telegram
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -19,42 +22,78 @@ import (
 )
 
 type buyDraft struct {
-	PlanID     string
-	Location   string
-	Distro     string
-	OSImage    string
-	AccessMode string // "pwd" or "ssh"
-	SSHKey     string
-	Awaiting   string // "ssh_key"
-	CreatedAt  time.Time
+	PlanID     string    `json:"plan_id,omitempty"`
+	Location   string    `json:"location,omitempty"`
+	Distro     string    `json:"distro,omitempty"`
+	OSImage    string    `json:"os_image,omitempty"`
+	AccessMode string    `json:"access_mode,omitempty"` // "pwd" or "ssh"
+	SSHKey     string    `json:"ssh_key,omitempty"`
+	Awaiting   string    `json:"awaiting,omitempty"` // "ssh_key"
+	CreatedAt  time.Time `json:"created_at,omitempty"`
 }
 
 func (s *Service) getBuyDraft(userID int64) *buyDraft {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	d, ok := s.buyDrafts[userID]
-	if !ok || d == nil {
+	s.mu.RUnlock()
+	if ok && d != nil {
+		if time.Since(d.CreatedAt) <= 2*time.Hour {
+			return d
+		}
+		s.clearBuyDraft(userID)
 		return nil
 	}
-	if time.Since(d.CreatedAt) > 2*time.Hour {
-		return nil
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var loaded buyDraft
+		step, found, err := conv.GetConversationState(ctx, userID, "buy", &loaded)
+		if err == nil && found {
+			if loaded.CreatedAt.IsZero() {
+				loaded.CreatedAt = time.Now().UTC()
+			}
+			if loaded.Awaiting == "" && step != "" {
+				loaded.Awaiting = step
+			}
+			s.mu.Lock()
+			s.buyDrafts[userID] = &loaded
+			s.mu.Unlock()
+			return &loaded
+		}
 	}
-	return d
+	return nil
 }
 
 func (s *Service) setBuyDraft(userID int64, d *buyDraft) {
+	if d == nil {
+		s.clearBuyDraft(userID)
+		return
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if d.CreatedAt.IsZero() {
 		d.CreatedAt = time.Now().UTC()
 	}
 	s.buyDrafts[userID] = d
+	s.mu.Unlock()
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = conv.SaveConversationState(ctx, userID, "buy", d.Awaiting, d, time.Now().UTC().Add(2*time.Hour))
+	}
 }
 
 func (s *Service) clearBuyDraft(userID int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.buyDrafts, userID)
+	s.mu.Unlock()
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = conv.DeleteConversationState(ctx, userID, "buy")
+	}
 }
 
 func validateSSHPublicKey(raw string) (string, error) {
@@ -376,6 +415,13 @@ func (s *Service) sendBuyStep4Confirm(ctx context.Context, chatID telego.ChatID,
 
 // Step 5: Provisioning Execution
 func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, userID int64, planID, location, osImage, accessMode string) error {
+	// In-flight buy lock to prevent double-click server creation
+	if _, loaded := s.inFlightBuys.LoadOrStore(userID, struct{}{}); loaded {
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "⏳ درخواست خرید سرور شما در حال پردازش است، لطفاً کمی صبر فرمایید..."))
+		return nil
+	}
+	defer s.inFlightBuys.Delete(userID)
+
 	usr, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil || usr == nil {
 		return s.sendAccessDenied(ctx, chatID)
@@ -405,38 +451,35 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	hourlyIRT := pricing.CalculatePriceIRT(it.HourlyUSDMicro, sellRate)
 	initialBlockIRT := hourlyIRT
 
-	w, err := s.store.Wallets().GetByUserID(ctx, userID)
-	if err != nil {
-		return err
-	}
+	orderSalt := make([]byte, 4)
+	_, _ = rand.Read(orderSalt)
+	orderID := fmt.Sprintf("ord-%d-%s", userID, hex.EncodeToString(orderSalt))
 
-	if w.CombinedValuation(sellRate) < initialBlockIRT {
-		draft := s.getBuyDraft(userID)
-		if draft != nil {
-			return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
+	w, err := s.store.Wallets().DebitAtomic(
+		ctx,
+		userID,
+		initialBlockIRT,
+		usr.Segment,
+		sellRate,
+		wallet.KindPurchase,
+		"order",
+		orderID,
+	)
+	if err != nil {
+		if errors.Is(err, wallet.ErrBelowFloor) {
+			draft := s.getBuyDraft(userID)
+			if draft != nil {
+				return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
+			}
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ موجودی کیف پول شما برای این خرید کافی نیست (به سقف اعتبار رسیده‌اید)."))
+			return nil
 		}
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ Insufficient wallet balance."))
+		slog.Error("failed to debit wallet atomically", "user_id", userID, "err", err)
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ خطا در کسر از موجودی کیف پول."))
 		return nil
 	}
 
 	waitMsg, _ := s.sendMessage(ctx, tu.Message(chatID, "⏳ <b>Deploying server on Hetzner Cloud...</b>").WithParseMode(telego.ModeHTML))
-
-	// 1. Debit initial block from wallet
-	w.BalanceIRT -= initialBlockIRT
-	_ = s.store.Wallets().UpdateBalances(ctx, w)
-
-	orderID := fmt.Sprintf("ord-%d-%d", userID, time.Now().UnixNano()%1000000)
-	_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
-		ID:           fmt.Sprintf("led-%d", time.Now().UnixNano()),
-		WalletID:     w.ID,
-		Currency:     wallet.CurrencyIRT,
-		Amount:       -int64(initialBlockIRT),
-		Kind:         wallet.KindPurchase,
-		BalanceAfter: int64(w.BalanceIRT),
-		RefType:      "order",
-		RefID:        orderID,
-		CreatedAt:    time.Now().UTC(),
-	})
 
 	// 2. Create Order record
 	ord := &order.Order{
@@ -447,7 +490,9 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
-	_ = s.store.Orders().Save(ctx, ord, nil)
+	if err := s.store.Orders().Save(ctx, ord, nil); err != nil {
+		slog.Error("failed to save order", "err", err, "order_id", orderID)
+	}
 
 	// 3. Call CloudProvider
 	serverName := fmt.Sprintf("%s-%d-%d", it.HetznerType, userID, time.Now().Unix()%1000)
@@ -463,7 +508,28 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	if err != nil {
 		// Rollback debit on provider failure
 		w.BalanceIRT += initialBlockIRT
-		_ = s.store.Wallets().UpdateBalances(ctx, w)
+		if err := s.store.Wallets().UpdateBalances(ctx, w); err != nil {
+			slog.Error("failed to update wallet balance on rollback", "err", err, "user_id", userID)
+		}
+
+		// Compensating ledger entry to preserve accounting balance invariant: Balance == sum(Ledger Amounts)
+		revSalt := make([]byte, 4)
+		_, _ = rand.Read(revSalt)
+		revLedgID := fmt.Sprintf("led-rev-%d-%s", time.Now().UnixNano(), hex.EncodeToString(revSalt))
+		if err := s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
+			ID:           revLedgID,
+			WalletID:     w.ID,
+			Currency:     wallet.CurrencyIRT,
+			Amount:       int64(initialBlockIRT),
+			Kind:         wallet.KindUsageReversal,
+			BalanceAfter: int64(w.BalanceIRT),
+			RefType:      "order",
+			RefID:        ord.ID,
+			CreatedAt:    time.Now().UTC(),
+		}); err != nil {
+			slog.Error("failed to record compensating ledger entry", "err", err, "order_id", ord.ID)
+		}
+
 		ord.Status = order.StateFulfillmentFailed
 		_ = s.store.Orders().Save(ctx, ord, nil)
 
