@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"testing"
+
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/secrets"
 )
 
 func TestConfigDefaults(t *testing.T) {
@@ -63,5 +65,36 @@ func TestConfigEnvOverrides(t *testing.T) {
 
 	if err := cfg.ValidateProduction(); err != nil {
 		t.Fatalf("expected validation to pass when secrets are set: %v", err)
+	}
+}
+
+func TestDatabaseDSN(t *testing.T) {
+	cfg := &Config{
+		DBHost:     "127.0.0.1",
+		DBPort:     10000,
+		DBUser:     "shop",
+		DBName:     "shop",
+		DBSSLMode:  "disable",
+		DBPassword: secrets.New("secret123"),
+	}
+
+	expected := "postgres://shop:secret123@127.0.0.1:10000/shop?sslmode=disable"
+	if got := cfg.DatabaseDSN(); got != expected {
+		t.Fatalf("expected DSN %q, got %q", expected, got)
+	}
+
+	// DATABASE_URL takes precedence
+	cfg.DatabaseURL = "postgres://custom:pass@remote:5432/mydb?sslmode=require"
+	if got := cfg.DatabaseDSN(); got != cfg.DatabaseURL {
+		t.Fatalf("expected DSN %q, got %q", cfg.DatabaseURL, got)
+	}
+
+	// os.Getenv("DATABASE_URL") takes precedence when cfg.DatabaseURL is empty
+	cfg.DatabaseURL = ""
+	os.Setenv("DATABASE_URL", "postgres://envuser:envpass@envhost:5432/envdb?sslmode=verify-full")
+	defer os.Unsetenv("DATABASE_URL")
+
+	if got := cfg.DatabaseDSN(); got != "postgres://envuser:envpass@envhost:5432/envdb?sslmode=verify-full" {
+		t.Fatalf("expected env DSN, got %q", got)
 	}
 }
