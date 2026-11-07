@@ -2,13 +2,17 @@ package memory
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
@@ -349,6 +353,83 @@ func (r *walletRepo) UpdateBalances(_ context.Context, w *wallet.Wallet) error {
 	return nil
 }
 
+func (r *walletRepo) DebitAtomic(
+	_ context.Context,
+	userID int64,
+	totalIRT pricing.IRT,
+	segment fee.Segment,
+	sellRate pricing.IRT,
+	kind wallet.LedgerKind,
+	refType, refID string,
+) (*wallet.Wallet, error) {
+	if totalIRT <= 0 {
+		return nil, wallet.ErrInvalidDebitAmount
+	}
+	if sellRate <= 0 {
+		return nil, errors.New("memory: sell rate must be positive")
+	}
+
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+
+	w, ok := r.s.wallets[userID]
+	if !ok {
+		w = &wallet.Wallet{
+			ID:      userID,
+			UserID:  userID,
+			Version: 1,
+		}
+		r.s.wallets[userID] = w
+	}
+
+	if !w.CanPurchase(totalIRT, segment, sellRate) {
+		return nil, wallet.ErrBelowFloor
+	}
+
+	debitIRT, debitUSD := wallet.DebitSplit(totalIRT, w.BalanceIRT, sellRate)
+	w.BalanceIRT -= debitIRT
+	w.BalanceUSDMicro -= debitUSD
+	w.Version++
+
+	now := time.Now().UTC()
+	if debitIRT > 0 {
+		salt := make([]byte, 4)
+		_, _ = rand.Read(salt)
+		hexSalt := hex.EncodeToString(salt)
+		r.s.ledger = append(r.s.ledger, &wallet.LedgerEntry{
+			ID:           fmt.Sprintf("ledg-%d-%s", time.Now().UnixNano(), hexSalt),
+			WalletID:     w.ID,
+			Currency:     wallet.CurrencyIRT,
+			Amount:       -int64(debitIRT),
+			Kind:         kind,
+			BalanceAfter: int64(w.BalanceIRT),
+			RefType:      refType,
+			RefID:        refID,
+			CreatedAt:    now,
+		})
+	}
+
+	if debitUSD > 0 {
+		salt := make([]byte, 4)
+		_, _ = rand.Read(salt)
+		hexSalt := hex.EncodeToString(salt)
+		r.s.ledger = append(r.s.ledger, &wallet.LedgerEntry{
+			ID:           fmt.Sprintf("ledg-%d-%s", time.Now().UnixNano(), hexSalt),
+			WalletID:     w.ID,
+			Currency:     wallet.CurrencyUSD,
+			Amount:       -int64(debitUSD),
+			Kind:         kind,
+			BalanceAfter: int64(w.BalanceUSDMicro),
+			RefType:      refType,
+			RefID:        refID,
+			CreatedAt:    now,
+		})
+	}
+
+	cp := *w
+	return &cp, nil
+}
+
 // --- OrderRepo ---
 
 type orderRepo struct{ s *Store }
@@ -419,6 +500,52 @@ func (r *receiptRepo) Save(_ context.Context, rcp *receipt.Receipt) error {
 	r.s.receiptByHash[rcp.ImageSHA256] = rcp.ID
 	r.s.receiptByTrack[rcp.TrackingCodeNorm] = rcp.ID
 	return nil
+}
+
+func (r *receiptRepo) ApproveReceipt(_ context.Context, receiptID string, adminID int64, amountIRT pricing.IRT, now time.Time) (*receipt.Receipt, *wallet.Wallet, error) {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+
+	rcp, ok := r.s.receipts[receiptID]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	if err := rcp.Approve(adminID, now); err != nil {
+		return nil, nil, err
+	}
+	rcp.AmountIRT = amountIRT
+
+	w, ok := r.s.wallets[rcp.UserID]
+	if !ok {
+		w = &wallet.Wallet{
+			ID:      rcp.UserID,
+			UserID:  rcp.UserID,
+			Version: 1,
+		}
+		r.s.wallets[rcp.UserID] = w
+	}
+	w.BalanceIRT += amountIRT
+	w.Version++
+
+	salt := make([]byte, 4)
+	_, _ = rand.Read(salt)
+	hexSalt := hex.EncodeToString(salt)
+	ledgID := fmt.Sprintf("ledg-rcpt-%d-%s", now.UnixNano(), hexSalt)
+	r.s.ledger = append(r.s.ledger, &wallet.LedgerEntry{
+		ID:           ledgID,
+		WalletID:     w.ID,
+		Currency:     wallet.CurrencyIRT,
+		Amount:       int64(amountIRT),
+		Kind:         wallet.KindTopupReceipt,
+		BalanceAfter: int64(w.BalanceIRT),
+		RefType:      "receipt",
+		RefID:        rcp.ID,
+		CreatedAt:    now,
+	})
+
+	rcpCopy := *rcp
+	wCopy := *w
+	return &rcpCopy, &wCopy, nil
 }
 
 // --- RefundRepo ---

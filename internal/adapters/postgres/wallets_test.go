@@ -418,4 +418,9 @@ func TestWalletRepository_DebitAtomic(t *testing.T) {
 	if finalW.BalanceIRT != 10_000 {
 		t.Errorf("expected final BalanceIRT 10000, got %d", finalW.BalanceIRT)
 	}
+
+	// 4. Validate sellRate <= 0 error
+	if _, err := s.Wallets().DebitAtomic(ctx, userID, 10_000, fee.SegmentNew, 0, wallet.KindPurchase, "order", "ord_zero_rate"); err == nil {
+		t.Error("expected error for sellRate <= 0, got nil")
+	}
 }

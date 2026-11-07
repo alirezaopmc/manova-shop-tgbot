@@ -192,41 +192,70 @@ func TestDownAndReapplyMigrations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	m, err := Open(dsn)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer func() { _ = m.Close() }()
-
-	// Ensure Up is applied first
-	if err := m.Up(ctx); err != nil {
-		t.Fatalf("Up before Down failed: %v", err)
-	}
-
-	// Test Down
-	if err := m.Down(ctx); err != nil {
-		t.Fatalf("Down failed: %v", err)
-	}
-
-	// Verify shop schema or tables are dropped
+	// 1. Create isolated test schema
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("connect to database: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
+	testSchema := fmt.Sprintf("test_mig_%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA %s", testSchema)); err != nil {
+		t.Fatalf("failed to create isolated test schema %s: %v", testSchema, err)
+	}
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanCancel()
+		_, _ = db.ExecContext(cleanCtx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", testSchema))
+	})
+
+	// 2. Open migrator targeting the isolated test schema via search_path
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	isolatedDSN := fmt.Sprintf("%s%ssearch_path=%s", dsn, sep, testSchema)
+
+	m, err := Open(isolatedDSN)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	// Ensure Up is applied first in isolated test schema
+	if err := m.Up(ctx); err != nil {
+		t.Fatalf("Up before Down failed: %v", err)
+	}
+
+	var initialTableCount int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1
+	`, testSchema).Scan(&initialTableCount)
+	if err != nil {
+		t.Fatalf("query table count in test schema: %v", err)
+	}
+	if initialTableCount < 15 {
+		t.Fatalf("expected at least 15 tables in isolated schema %s, got %d", testSchema, initialTableCount)
+	}
+
+	// Test Down - drops tables in isolated test schema
+	if err := m.Down(ctx); err != nil {
+		t.Fatalf("Down failed: %v", err)
+	}
+
+	// Verify isolated schema tables (excluding goose version tracking table) are dropped
 	var tableCount int
 	err = db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'shop'
-	`).Scan(&tableCount)
+		SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name != 'goose_db_version'
+	`, testSchema).Scan(&tableCount)
 	if err != nil {
 		t.Fatalf("query table count after Down: %v", err)
 	}
 	if tableCount != 0 {
-		t.Errorf("expected 0 tables in shop schema after Down, got %d", tableCount)
+		t.Errorf("expected 0 tables in %s schema after Down, got %d", testSchema, tableCount)
 	}
 
-	// Reapply Up to leave the database in ready state
+	// Reapply Up in isolated test schema
 	if err := m.Up(ctx); err != nil {
 		t.Fatalf("reapply Up after Down failed: %v", err)
 	}

@@ -2,6 +2,8 @@ package telegram
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1326,50 +1328,18 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 	}
 	defer s.inFlightReceipts.Delete(rcptID)
 
-	rcp, err := s.store.Receipts().GetByID(ctx, rcptID)
-	if err != nil || rcp == nil {
-		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
-		return nil
-	}
-
-	if rcp.Status == receipt.StatusApproved || rcp.Status == receipt.StatusRejected {
-		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
-		return nil
-	}
-
-	if err := rcp.Approve(adminID, now); err != nil {
+	rcp, w, err := s.store.Receipts().ApproveReceipt(ctx, rcptID, adminID, pricing.IRT(amountIRT), now)
+	if err != nil {
+		if errors.Is(err, memory.ErrNotFound) || errors.Is(err, postgres.ErrNotFound) {
+			_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
+			return nil
+		}
 		if errors.Is(err, receipt.ErrReceiptAlreadyDecided) {
 			_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
 			return nil
 		}
 		return err
 	}
-	rcp.AmountIRT = pricing.IRT(amountIRT)
-	if err := s.store.Receipts().Save(ctx, rcp); err != nil {
-		return err
-	}
-
-	// Credit user's wallet
-	w, err := s.store.Wallets().GetByUserID(ctx, rcp.UserID)
-	if err != nil {
-		return err
-	}
-	w.BalanceIRT += pricing.IRT(amountIRT)
-	if err := s.store.Wallets().UpdateBalances(ctx, w); err != nil {
-		return err
-	}
-
-	_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
-		ID:           fmt.Sprintf("ledg-rcpt-%d", time.Now().UnixNano()),
-		WalletID:     w.ID,
-		Currency:     wallet.CurrencyIRT,
-		Amount:       amountIRT,
-		Kind:         wallet.KindTopupReceipt,
-		BalanceAfter: int64(w.BalanceIRT),
-		RefType:      "receipt",
-		RefID:        rcp.ID,
-		CreatedAt:    now,
-	})
 
 	// 1. Notify User
 	userNotice := fmt.Sprintf(
@@ -1712,35 +1682,46 @@ func (s *Service) handleAdminWalletAdjustExec(ctx context.Context, cb *telego.Ca
 
 	var opDesc string
 	var deltaText string
+	var ledgerAmount int64
 
 	switch op {
 	case "add":
 		w.BalanceIRT += pricing.IRT(amountIRT)
 		opDesc = "افزایش موجودی"
 		deltaText = fmt.Sprintf("+%s تومان", formatNumber(amountIRT))
+		ledgerAmount = amountIRT
 	case "sub":
 		w.BalanceIRT -= pricing.IRT(amountIRT)
 		opDesc = "کاهش موجودی"
 		deltaText = fmt.Sprintf("-%s تومان", formatNumber(amountIRT))
+		ledgerAmount = -amountIRT
 	case "zero":
+		prevBalance := int64(w.BalanceIRT)
 		w.BalanceIRT = 0
 		opDesc = "صفر کردن موجودی"
 		deltaText = "موجودی صفر شد"
+		ledgerAmount = -prevBalance
 	}
 
 	if err := s.store.Wallets().UpdateBalances(ctx, w); err != nil {
 		return err
 	}
 
-	_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
-		ID:           fmt.Sprintf("ledg-adm-%d", time.Now().UnixNano()),
+	salt := make([]byte, 4)
+	_, _ = rand.Read(salt)
+	hexSalt := hex.EncodeToString(salt)
+	ledgID := fmt.Sprintf("ledg-adm-%d-%s", time.Now().UnixNano(), hexSalt)
+	if err := s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
+		ID:           ledgID,
 		WalletID:     w.ID,
 		Currency:     wallet.CurrencyIRT,
-		Amount:       amountIRT,
+		Amount:       ledgerAmount,
 		Kind:         wallet.KindAdminAdjustment,
 		BalanceAfter: int64(w.BalanceIRT),
 		CreatedAt:    now,
-	})
+	}); err != nil {
+		slog.Error("failed to record admin adjustment ledger entry", "err", err, "wallet_id", w.ID)
+	}
 
 	// 1. Notify target user in Telegram
 	userNotice := fmt.Sprintf(

@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -237,6 +239,9 @@ func (r *walletRepo) DebitAtomic(
 	if totalIRT <= 0 {
 		return nil, wallet.ErrInvalidDebitAmount
 	}
+	if sellRate <= 0 {
+		return nil, errors.New("postgres: sell rate must be positive")
+	}
 
 	tx, err := r.s.pool.Begin(ctx)
 	if err != nil {
@@ -345,7 +350,10 @@ func (r *walletRepo) DebitAtomic(
 		)
 	`
 	if debitIRT > 0 {
-		ledgID := fmt.Sprintf("ledg-irt-%d-%d", userID, time.Now().UnixNano())
+		salt := make([]byte, 4)
+		_, _ = rand.Read(salt)
+		hexSalt := hex.EncodeToString(salt)
+		ledgID := fmt.Sprintf("ledg-%d-%s", time.Now().UnixNano(), hexSalt)
 		if _, err := tx.Exec(
 			ctx,
 			ledgerQuery,
@@ -364,7 +372,10 @@ func (r *walletRepo) DebitAtomic(
 	}
 
 	if debitUSD > 0 {
-		ledgID := fmt.Sprintf("ledg-usd-%d-%d", userID, time.Now().UnixNano())
+		salt := make([]byte, 4)
+		_, _ = rand.Read(salt)
+		hexSalt := hex.EncodeToString(salt)
+		ledgID := fmt.Sprintf("ledg-%d-%s", time.Now().UnixNano(), hexSalt)
 		if _, err := tx.Exec(
 			ctx,
 			ledgerQuery,

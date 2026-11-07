@@ -204,6 +204,12 @@ func (r *billingRepo) SaveResource(ctx context.Context, res *billing.Provisioned
 		powerState = billing.PowerStateRunning
 	}
 
+	var billingEndAt *time.Time
+	if res.BillingEndAt != nil {
+		t := res.BillingEndAt.UTC()
+		billingEndAt = &t
+	}
+
 	query := `
 		INSERT INTO shop.provisioned_resources (
 			id, user_id, server_name, order_item_id, external_id,
@@ -256,7 +262,7 @@ func (r *billingRepo) SaveResource(ctx context.Context, res *billing.Provisioned
 		res.RootPassword,
 		res.SSHKey,
 		startAt,
-		res.BillingEndAt,
+		billingEndAt,
 		res.PostedThroughMinute,
 		res.RemainderMicroIRT,
 		verifiedAt,

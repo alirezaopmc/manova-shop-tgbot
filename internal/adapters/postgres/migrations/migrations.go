@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/pressly/goose/v3"
@@ -24,6 +25,13 @@ type Migrator struct {
 // Open connects to databaseURL using pgx and prepares the embedded migrations.
 // The caller must call Close() when finished.
 func Open(databaseURL string) (*Migrator, error) {
+	if !strings.Contains(databaseURL, "search_path=") {
+		sep := "?"
+		if strings.Contains(databaseURL, "?") {
+			sep = "&"
+		}
+		databaseURL = databaseURL + sep + "search_path=shop,public"
+	}
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("migrations: open database: %w", err)

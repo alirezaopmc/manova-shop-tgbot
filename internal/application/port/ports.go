@@ -6,6 +6,7 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
@@ -128,6 +129,7 @@ type WalletRepository interface {
 	GetByUserID(ctx context.Context, userID int64) (*wallet.Wallet, error)
 	RecordLedgerEntry(ctx context.Context, entry *wallet.LedgerEntry) error
 	UpdateBalances(ctx context.Context, w *wallet.Wallet) error
+	DebitAtomic(ctx context.Context, userID int64, totalIRT pricing.IRT, segment fee.Segment, sellRate pricing.IRT, kind wallet.LedgerKind, refType, refID string) (*wallet.Wallet, error)
 }
 
 // ReceiptRepository handles payment receipt persistence.
@@ -136,6 +138,7 @@ type ReceiptRepository interface {
 	FindByImageSHA256(ctx context.Context, hash string) (*receipt.Receipt, error)
 	FindByTrackingCode(ctx context.Context, trackingCode string) (*receipt.Receipt, error)
 	Save(ctx context.Context, r *receipt.Receipt) error
+	ApproveReceipt(ctx context.Context, receiptID string, adminID int64, amountIRT pricing.IRT, now time.Time) (*receipt.Receipt, *wallet.Wallet, error)
 }
 
 // RefundRepository handles refund request persistence.

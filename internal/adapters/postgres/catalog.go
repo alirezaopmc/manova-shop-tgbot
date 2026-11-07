@@ -220,37 +220,49 @@ func (r *osCatalogRepo) ReplaceSnapshot(ctx context.Context, entries []osimage.E
 			$10, $11
 		)
 	`
-	for _, e := range entries {
-		entrySyncedAt := e.SyncedAt
-		if entrySyncedAt.IsZero() {
-			entrySyncedAt = syncedAt
-		} else {
-			entrySyncedAt = entrySyncedAt.UTC()
-		}
-		status := string(e.HetznerStatus)
-		if status == "" {
-			status = string(osimage.StatusAvailable)
-		}
-		var unavail *time.Time
-		if e.UnavailableAfter != nil {
-			t := e.UnavailableAfter.UTC()
-			unavail = &t
+	if len(entries) > 0 {
+		batch := &pgx.Batch{}
+		for _, e := range entries {
+			entrySyncedAt := e.SyncedAt
+			if entrySyncedAt.IsZero() {
+				entrySyncedAt = syncedAt
+			} else {
+				entrySyncedAt = entrySyncedAt.UTC()
+			}
+			status := string(e.HetznerStatus)
+			if status == "" {
+				status = string(osimage.StatusAvailable)
+			}
+			var unavail *time.Time
+			if e.UnavailableAfter != nil {
+				t := e.UnavailableAfter.UTC()
+				unavail = &t
+			}
+
+			batch.Queue(insertQuery,
+				e.ID,
+				string(e.Distribution),
+				e.Version,
+				string(e.Architecture),
+				e.ImageName,
+				status,
+				unavail,
+				e.DisplayNameFA,
+				e.DisplayNameEN,
+				e.SortOrder,
+				entrySyncedAt,
+			)
 		}
 
-		if _, err := tx.Exec(ctx, insertQuery,
-			e.ID,
-			string(e.Distribution),
-			e.Version,
-			string(e.Architecture),
-			e.ImageName,
-			status,
-			unavail,
-			e.DisplayNameFA,
-			e.DisplayNameEN,
-			e.SortOrder,
-			entrySyncedAt,
-		); err != nil {
-			return fmt.Errorf("postgres: insert os entry %s: %w", e.ID, err)
+		br := tx.SendBatch(ctx, batch)
+		for _, e := range entries {
+			if _, err := br.Exec(); err != nil {
+				_ = br.Close()
+				return fmt.Errorf("postgres: batch insert os entry %s: %w", e.ID, err)
+			}
+		}
+		if err := br.Close(); err != nil {
+			return fmt.Errorf("postgres: close batch insert os entries: %w", err)
 		}
 	}
 

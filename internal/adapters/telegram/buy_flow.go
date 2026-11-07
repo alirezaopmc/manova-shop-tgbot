@@ -2,8 +2,11 @@ package telegram
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -448,38 +451,35 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	hourlyIRT := pricing.CalculatePriceIRT(it.HourlyUSDMicro, sellRate)
 	initialBlockIRT := hourlyIRT
 
-	w, err := s.store.Wallets().GetByUserID(ctx, userID)
-	if err != nil {
-		return err
-	}
+	orderSalt := make([]byte, 4)
+	_, _ = rand.Read(orderSalt)
+	orderID := fmt.Sprintf("ord-%d-%s", userID, hex.EncodeToString(orderSalt))
 
-	if w.CombinedValuation(sellRate) < initialBlockIRT {
-		draft := s.getBuyDraft(userID)
-		if draft != nil {
-			return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
+	w, err := s.store.Wallets().DebitAtomic(
+		ctx,
+		userID,
+		initialBlockIRT,
+		usr.Segment,
+		sellRate,
+		wallet.KindPurchase,
+		"order",
+		orderID,
+	)
+	if err != nil {
+		if errors.Is(err, wallet.ErrBelowFloor) {
+			draft := s.getBuyDraft(userID)
+			if draft != nil {
+				return s.sendBuyStep4Confirm(ctx, chatID, userID, draft)
+			}
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ موجودی کیف پول شما برای این خرید کافی نیست (به سقف اعتبار رسیده‌اید)."))
+			return nil
 		}
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ Insufficient wallet balance."))
+		slog.Error("failed to debit wallet atomically", "user_id", userID, "err", err)
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ خطا در کسر از موجودی کیف پول."))
 		return nil
 	}
 
 	waitMsg, _ := s.sendMessage(ctx, tu.Message(chatID, "⏳ <b>Deploying server on Hetzner Cloud...</b>").WithParseMode(telego.ModeHTML))
-
-	// 1. Debit initial block from wallet
-	w.BalanceIRT -= initialBlockIRT
-	_ = s.store.Wallets().UpdateBalances(ctx, w)
-
-	orderID := fmt.Sprintf("ord-%d-%d", userID, time.Now().UnixNano()%1000000)
-	_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
-		ID:           fmt.Sprintf("led-%d", time.Now().UnixNano()),
-		WalletID:     w.ID,
-		Currency:     wallet.CurrencyIRT,
-		Amount:       -int64(initialBlockIRT),
-		Kind:         wallet.KindPurchase,
-		BalanceAfter: int64(w.BalanceIRT),
-		RefType:      "order",
-		RefID:        orderID,
-		CreatedAt:    time.Now().UTC(),
-	})
 
 	// 2. Create Order record
 	ord := &order.Order{
@@ -490,7 +490,9 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
-	_ = s.store.Orders().Save(ctx, ord, nil)
+	if err := s.store.Orders().Save(ctx, ord, nil); err != nil {
+		slog.Error("failed to save order", "err", err, "order_id", orderID)
+	}
 
 	// 3. Call CloudProvider
 	serverName := fmt.Sprintf("%s-%d-%d", it.HetznerType, userID, time.Now().Unix()%1000)
@@ -506,11 +508,16 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	if err != nil {
 		// Rollback debit on provider failure
 		w.BalanceIRT += initialBlockIRT
-		_ = s.store.Wallets().UpdateBalances(ctx, w)
+		if err := s.store.Wallets().UpdateBalances(ctx, w); err != nil {
+			slog.Error("failed to update wallet balance on rollback", "err", err, "user_id", userID)
+		}
 
 		// Compensating ledger entry to preserve accounting balance invariant: Balance == sum(Ledger Amounts)
-		_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
-			ID:           fmt.Sprintf("led-rev-%d", time.Now().UnixNano()),
+		revSalt := make([]byte, 4)
+		_, _ = rand.Read(revSalt)
+		revLedgID := fmt.Sprintf("led-rev-%d-%s", time.Now().UnixNano(), hex.EncodeToString(revSalt))
+		if err := s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
+			ID:           revLedgID,
 			WalletID:     w.ID,
 			Currency:     wallet.CurrencyIRT,
 			Amount:       int64(initialBlockIRT),
@@ -519,7 +526,9 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 			RefType:      "order",
 			RefID:        ord.ID,
 			CreatedAt:    time.Now().UTC(),
-		})
+		}); err != nil {
+			slog.Error("failed to record compensating ledger entry", "err", err, "order_id", ord.ID)
+		}
 
 		ord.Status = order.StateFulfillmentFailed
 		_ = s.store.Orders().Save(ctx, ord, nil)

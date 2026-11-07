@@ -475,3 +475,83 @@ func TestReceiptRepository_ValidationErrors(t *testing.T) {
 		t.Fatal("expected error for nil pool Save, got nil")
 	}
 }
+
+func TestReceiptRepository_ApproveReceipt(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	rcpID := uniqueReceiptID()
+	cleanupReceipt(t, s, rcpID)
+	userID := int64(888777)
+	t.Cleanup(func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = s.Pool().Exec(cleanCtx, "DELETE FROM shop.wallets WHERE user_id = $1", userID)
+		_, _ = s.Pool().Exec(cleanCtx, "DELETE FROM shop.wallet_ledger WHERE wallet_id = $1", userID)
+	})
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	rcp := &receipt.Receipt{
+		ID:               rcpID,
+		UserID:           userID,
+		Purpose:          receipt.PurposeWalletTopup,
+		AmountIRR:        pricing.IRR(100_000_000),
+		AmountIRT:        pricing.IRT(10_000_000),
+		TrackingCodeNorm: fmt.Sprintf("TRK-APP-%d", time.Now().UnixNano()),
+		ImageSHA256:      fmt.Sprintf("sha256-app-%d", time.Now().UnixNano()),
+		ImageRef:         "s3://receipts/app.jpg",
+		Status:           receipt.StatusSubmitted,
+		CreatedAt:        now,
+	}
+	if err := s.Receipts().Save(ctx, rcp); err != nil {
+		t.Fatalf("failed to save test receipt: %v", err)
+	}
+
+	adminID := int64(999001)
+	creditIRT := pricing.IRT(10_000_000)
+	approvedRcp, w, err := s.Receipts().ApproveReceipt(ctx, rcpID, adminID, creditIRT, now)
+	if err != nil {
+		t.Fatalf("ApproveReceipt failed: %v", err)
+	}
+
+	if approvedRcp.Status != receipt.StatusApproved {
+		t.Errorf("expected approved status, got %s", approvedRcp.Status)
+	}
+	if approvedRcp.DecidedByAdminID == nil || *approvedRcp.DecidedByAdminID != adminID {
+		t.Errorf("expected decided_by_admin_id %d, got %v", adminID, approvedRcp.DecidedByAdminID)
+	}
+	if approvedRcp.AmountIRT != creditIRT {
+		t.Errorf("expected amount_irt %d, got %d", creditIRT, approvedRcp.AmountIRT)
+	}
+	if w.BalanceIRT != creditIRT {
+		t.Errorf("expected wallet balance %d, got %d", creditIRT, w.BalanceIRT)
+	}
+
+	// Verify ledger entry
+	var (
+		ledgerKind   string
+		ledgerAmount int64
+		refType      string
+		refID        string
+	)
+	err = s.Pool().QueryRow(ctx, `
+		SELECT kind, amount, ref_type, ref_id
+		FROM shop.wallet_ledger
+		WHERE ref_type = 'receipt' AND ref_id = $1
+	`, rcpID).Scan(&ledgerKind, &ledgerAmount, &refType, &refID)
+	if err != nil {
+		t.Fatalf("failed to find ledger entry for approved receipt: %v", err)
+	}
+	if ledgerKind != "topup_receipt" {
+		t.Errorf("expected ledger kind topup_receipt, got %s", ledgerKind)
+	}
+	if ledgerAmount != int64(creditIRT) {
+		t.Errorf("expected ledger amount %d, got %d", creditIRT, ledgerAmount)
+	}
+
+	// Double approval must fail with ErrReceiptAlreadyDecided
+	_, _, err = s.Receipts().ApproveReceipt(ctx, rcpID, adminID, creditIRT, now)
+	if !errors.Is(err, receipt.ErrReceiptAlreadyDecided) {
+		t.Fatalf("expected ErrReceiptAlreadyDecided on second approval, got %v", err)
+	}
+}

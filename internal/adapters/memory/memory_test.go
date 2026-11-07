@@ -2,11 +2,15 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
 )
 
 func TestMemoryStoreUsersAndInvites(t *testing.T) {
@@ -98,5 +102,68 @@ func TestMemoryStoreUsersAndInvites(t *testing.T) {
 	}
 	if _, err := s.Users().FindByPhoneHash(ctx, hash); err == nil {
 		t.Fatalf("expected find by phone hash to fail after clearing")
+	}
+}
+
+func TestMemoryStoreDebitAtomicAndApproveReceipt(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	now := time.Now().UTC()
+
+	// Test ApproveReceipt
+	rcp := &receipt.Receipt{
+		ID:               "rcp-mem-1",
+		UserID:           500,
+		Purpose:          receipt.PurposeWalletTopup,
+		Status:           receipt.StatusSubmitted,
+		CreatedAt:        now,
+		TrackingCodeNorm: "TRK-MEM-1",
+		ImageSHA256:      "sha-mem-1",
+	}
+	if err := s.Receipts().Save(ctx, rcp); err != nil {
+		t.Fatalf("save receipt err: %v", err)
+	}
+
+	approvedRcp, w, err := s.Receipts().ApproveReceipt(ctx, rcp.ID, 999, 500_000, now)
+	if err != nil {
+		t.Fatalf("ApproveReceipt err: %v", err)
+	}
+	if approvedRcp.Status != receipt.StatusApproved || w.BalanceIRT != 500_000 {
+		t.Fatalf("expected approved and balance 500000, got status %s, bal %d", approvedRcp.Status, w.BalanceIRT)
+	}
+
+	// Double approval returns ErrReceiptAlreadyDecided
+	if _, _, err := s.Receipts().ApproveReceipt(ctx, rcp.ID, 999, 500_000, now); !errors.Is(err, receipt.ErrReceiptAlreadyDecided) {
+		t.Fatalf("expected ErrReceiptAlreadyDecided, got %v", err)
+	}
+
+	// Test DebitAtomic
+	debitedW, err := s.Wallets().DebitAtomic(ctx, 500, 200_000, fee.SegmentNew, 100_000, wallet.KindPurchase, "order", "ord-1")
+	if err != nil {
+		t.Fatalf("DebitAtomic err: %v", err)
+	}
+	if debitedW.BalanceIRT != 300_000 {
+		t.Fatalf("expected balance 300000, got %d", debitedW.BalanceIRT)
+	}
+
+	// Debit exceeding balance/floor returns ErrBelowFloor
+	if _, err := s.Wallets().DebitAtomic(ctx, 500, 1_000_000, fee.SegmentNew, 100_000, wallet.KindPurchase, "order", "ord-2"); !errors.Is(err, wallet.ErrBelowFloor) {
+		t.Fatalf("expected ErrBelowFloor, got %v", err)
+	}
+
+	// Sell rate <= 0 returns error
+	if _, err := s.Wallets().DebitAtomic(ctx, 500, 100_000, fee.SegmentNew, 0, wallet.KindPurchase, "order", "ord-3"); err == nil {
+		t.Fatalf("expected error for zero sell rate, got nil")
+	}
+
+	entries := s.LedgerEntries()
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 ledger entries (1 topup, 1 debit), got %d", len(entries))
+	}
+	if entries[0].Kind != wallet.KindTopupReceipt || entries[0].Amount != 500_000 {
+		t.Errorf("entry 0 mismatch: %+v", entries[0])
+	}
+	if entries[1].Kind != wallet.KindPurchase || entries[1].Amount != -200_000 {
+		t.Errorf("entry 1 mismatch: %+v", entries[1])
 	}
 }
