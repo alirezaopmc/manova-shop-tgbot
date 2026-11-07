@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,15 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 )
+
+// Repository handles user entity persistence.
+type Repository interface {
+	GetByID(ctx context.Context, userID int64) (*User, error)
+	FindByPhoneHash(ctx context.Context, phoneHash string) (*User, error)
+	Save(ctx context.Context, u *User) error
+	Count(ctx context.Context) (int64, error)
+	ListUsers(ctx context.Context, limit int) ([]User, error)
+}
 
 // Role defines user authorization tier.
 type Role string

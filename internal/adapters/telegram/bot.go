@@ -154,6 +154,25 @@ func (s *Service) sendMessage(ctx context.Context, p *telego.SendMessageParams) 
 	return s.bot.SendMessage(ctx, p)
 }
 
+// SendUserMessage sends an HTML text message to a specific Telegram user.
+func (s *Service) SendUserMessage(ctx context.Context, telegramUserID int64, text string) error {
+	msg := tu.Message(tu.ID(telegramUserID), text)
+	_, err := s.sendMessage(ctx, msg)
+	return err
+}
+
+// SendAdminAlert sends an alert text message to the configured admin Telegram user.
+func (s *Service) SendAdminAlert(ctx context.Context, text string) error {
+	if s.cfg == nil || s.cfg.AdminTelegramID == 0 {
+		return nil
+	}
+	msg := tu.Message(tu.ID(s.cfg.AdminTelegramID), text)
+	_, err := s.sendMessage(ctx, msg)
+	return err
+}
+
+var _ port.Notifier = (*Service)(nil)
+
 func (s *Service) sendPhoto(ctx context.Context, p *telego.SendPhotoParams) (*telego.Message, error) {
 	if s.onSendPhoto != nil {
 		s.onSendPhoto(p)

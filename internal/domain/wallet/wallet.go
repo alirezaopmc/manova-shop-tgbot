@@ -1,12 +1,21 @@
 package wallet
 
 import (
+	"context"
 	"errors"
 	"time"
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 )
+
+// Repository handles wallet and ledger persistence.
+type Repository interface {
+	GetByUserID(ctx context.Context, userID int64) (*Wallet, error)
+	RecordLedgerEntry(ctx context.Context, entry *LedgerEntry) error
+	UpdateBalances(ctx context.Context, w *Wallet) error
+	DebitAtomic(ctx context.Context, userID int64, totalIRT pricing.IRT, segment fee.Segment, sellRate pricing.IRT, kind LedgerKind, refType, refID string) (*Wallet, error)
+}
 
 // Currency represents currency code in ledger entries.
 type Currency string

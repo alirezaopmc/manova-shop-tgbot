@@ -18,6 +18,8 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres/migrations"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/telegram"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
 )
 
@@ -118,6 +120,19 @@ func main() {
 	})
 
 	service := telegram.NewService(bot, cfg, store, hetznerClient)
+
+	billingWorker := billing.NewWorker(store, hetznerClient, service, billing.WorkerConfig{
+		TickInterval: 60 * time.Second,
+		SpreadIRT:    pricing.IRT(cfg.RateSpreadIRTPerUSD),
+		GracePeriod:  time.Duration(cfg.DeletionGraceMinutes) * time.Minute,
+		Logger:       logger,
+	})
+
+	go func() {
+		if err := billingWorker.Run(ctx); err != nil && err != context.Canceled {
+			slog.Error("billing worker stopped with error", "error", err)
+		}
+	}()
 
 	go func() {
 		if err := service.Start(ctx); err != nil && err != context.Canceled {
