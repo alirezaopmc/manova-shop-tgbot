@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 )
 
@@ -71,6 +69,10 @@ func TestStoreInterfaceSatisfaction(t *testing.T) {
 		t.Error("FxRates() returned nil")
 	}
 	var _ port.FxRateSource = s.FxRates()
+
+	if s.Conversations() == nil {
+		t.Error("Conversations() returned nil")
+	}
 }
 
 func TestStoreConnectionAndPool(t *testing.T) {
@@ -137,41 +139,5 @@ func TestSubRepositoryStubsReturnNotImplemented(t *testing.T) {
 	}
 	if err := s.Refunds().Save(ctx, nil); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("expected ErrNotImplemented from Refunds().Save, got %v", err)
-	}
-
-	// Catalog
-	if _, err := s.Catalog().GetItem(ctx, "item"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Catalog().GetItem, got %v", err)
-	}
-	if _, err := s.Catalog().ListActiveItems(ctx); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Catalog().ListActiveItems, got %v", err)
-	}
-
-	// OSCatalog
-	if _, err := s.OSCatalog().GetOffered(ctx, osimage.DistroUbuntu, osimage.ArchX86); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from OSCatalog().GetOffered, got %v", err)
-	}
-	if err := s.OSCatalog().ReplaceSnapshot(ctx, nil, time.Now()); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from OSCatalog().ReplaceSnapshot, got %v", err)
-	}
-
-	// Billing
-	if _, err := s.Billing().GetResource(ctx, "res"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Billing().GetResource, got %v", err)
-	}
-	if _, err := s.Billing().ListActiveResources(ctx); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Billing().ListActiveResources, got %v", err)
-	}
-	if _, err := s.Billing().ListUserResources(ctx, 1); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Billing().ListUserResources, got %v", err)
-	}
-	if err := s.Billing().SaveResource(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Billing().SaveResource, got %v", err)
-	}
-	if err := s.Billing().SaveMinutePosting(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Billing().SaveMinutePosting, got %v", err)
-	}
-	if err := s.Billing().UpdateResourceBillingEnd(ctx, "res", time.Now(), billing.ResourceStatusDeleted); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Billing().UpdateResourceBillingEnd, got %v", err)
 	}
 }

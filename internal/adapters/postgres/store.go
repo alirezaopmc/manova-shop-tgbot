@@ -11,9 +11,6 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/refund"
 )
@@ -46,16 +43,17 @@ var (
 type Store struct {
 	pool *pgxpool.Pool
 
-	users     *userRepo
-	invites   *inviteRepo
-	wallets   *walletRepo
-	orders    *orderRepo
-	receipts  *receiptRepo
-	refunds   *refundRepo
-	catalog   *catalogRepo
-	osCatalog *osCatalogRepo
-	billing   *billingRepo
-	fxRates   *fxRateRepo
+	users         *userRepo
+	invites       *inviteRepo
+	wallets       *walletRepo
+	orders        *orderRepo
+	receipts      *receiptRepo
+	refunds       *refundRepo
+	catalog       *catalogRepo
+	osCatalog     *osCatalogRepo
+	billing       *billingRepo
+	fxRates       *fxRateRepo
+	conversations *ConversationStore
 
 	mu         sync.RWMutex
 	marketRate pricing.IRT
@@ -77,6 +75,7 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	s.osCatalog = &osCatalogRepo{s: s}
 	s.billing = &billingRepo{s: s}
 	s.fxRates = &fxRateRepo{s: s}
+	s.conversations = &ConversationStore{s: s}
 	return s
 }
 
@@ -144,6 +143,7 @@ func (s *Store) Catalog() port.CatalogRepository     { return s.catalog }
 func (s *Store) OSCatalog() port.OSCatalogRepository { return s.osCatalog }
 func (s *Store) Billing() port.BillingRepository     { return s.billing }
 func (s *Store) FxRates() port.FxRateSource          { return s.fxRates }
+func (s *Store) Conversations() *ConversationStore   { return s.conversations }
 
 // --- Sub-repository scaffolding stubs ---
 
@@ -153,45 +153,6 @@ func (r *refundRepo) GetByID(_ context.Context, _ string) (*refund.Request, erro
 	return nil, ErrNotImplemented
 }
 func (r *refundRepo) Save(_ context.Context, _ *refund.Request) error {
-	return ErrNotImplemented
-}
-
-type catalogRepo struct{ s *Store }
-
-func (r *catalogRepo) GetItem(_ context.Context, _ string) (*catalog.Item, error) {
-	return nil, ErrNotImplemented
-}
-func (r *catalogRepo) ListActiveItems(_ context.Context) ([]catalog.Item, error) {
-	return nil, ErrNotImplemented
-}
-
-type osCatalogRepo struct{ s *Store }
-
-func (r *osCatalogRepo) GetOffered(_ context.Context, _ osimage.Distribution, _ osimage.Architecture) ([]osimage.Entry, error) {
-	return nil, ErrNotImplemented
-}
-func (r *osCatalogRepo) ReplaceSnapshot(_ context.Context, _ []osimage.Entry, _ time.Time) error {
-	return ErrNotImplemented
-}
-
-type billingRepo struct{ s *Store }
-
-func (r *billingRepo) GetResource(_ context.Context, _ string) (*billing.ProvisionedResource, error) {
-	return nil, ErrNotImplemented
-}
-func (r *billingRepo) ListActiveResources(_ context.Context) ([]billing.ProvisionedResource, error) {
-	return nil, ErrNotImplemented
-}
-func (r *billingRepo) ListUserResources(_ context.Context, _ int64) ([]billing.ProvisionedResource, error) {
-	return nil, ErrNotImplemented
-}
-func (r *billingRepo) SaveResource(_ context.Context, _ *billing.ProvisionedResource) error {
-	return ErrNotImplemented
-}
-func (r *billingRepo) SaveMinutePosting(_ context.Context, _ *billing.MinutePosting) error {
-	return ErrNotImplemented
-}
-func (r *billingRepo) UpdateResourceBillingEnd(_ context.Context, _ string, _ time.Time, _ billing.ResourceStatus) error {
 	return ErrNotImplemented
 }
 
