@@ -131,28 +131,6 @@ func TestSubRepositoryStubsReturnNotImplemented(t *testing.T) {
 	s := NewStore(nil)
 	ctx := context.Background()
 
-	// Orders
-	if _, err := s.Orders().GetByID(ctx, "ord"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Orders().GetByID, got %v", err)
-	}
-	if err := s.Orders().Save(ctx, nil, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Orders().Save, got %v", err)
-	}
-
-	// Receipts
-	if _, err := s.Receipts().GetByID(ctx, "rcp"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Receipts().GetByID, got %v", err)
-	}
-	if _, err := s.Receipts().FindByImageSHA256(ctx, "hash"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Receipts().FindByImageSHA256, got %v", err)
-	}
-	if _, err := s.Receipts().FindByTrackingCode(ctx, "track"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Receipts().FindByTrackingCode, got %v", err)
-	}
-	if err := s.Receipts().Save(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Receipts().Save, got %v", err)
-	}
-
 	// Refunds
 	if _, err := s.Refunds().GetByID(ctx, "ref"); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("expected ErrNotImplemented from Refunds().GetByID, got %v", err)

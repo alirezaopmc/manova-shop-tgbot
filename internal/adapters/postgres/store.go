@@ -13,10 +13,8 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/refund"
 )
 
@@ -148,30 +146,6 @@ func (s *Store) Billing() port.BillingRepository     { return s.billing }
 func (s *Store) FxRates() port.FxRateSource          { return s.fxRates }
 
 // --- Sub-repository scaffolding stubs ---
-
-type orderRepo struct{ s *Store }
-
-func (r *orderRepo) GetByID(_ context.Context, _ string) (*order.Order, error) {
-	return nil, ErrNotImplemented
-}
-func (r *orderRepo) Save(_ context.Context, _ *order.Order, _ *order.OrderEvent) error {
-	return ErrNotImplemented
-}
-
-type receiptRepo struct{ s *Store }
-
-func (r *receiptRepo) GetByID(_ context.Context, _ string) (*receipt.Receipt, error) {
-	return nil, ErrNotImplemented
-}
-func (r *receiptRepo) FindByImageSHA256(_ context.Context, _ string) (*receipt.Receipt, error) {
-	return nil, ErrNotImplemented
-}
-func (r *receiptRepo) FindByTrackingCode(_ context.Context, _ string) (*receipt.Receipt, error) {
-	return nil, ErrNotImplemented
-}
-func (r *receiptRepo) Save(_ context.Context, _ *receipt.Receipt) error {
-	return ErrNotImplemented
-}
 
 type refundRepo struct{ s *Store }
 
