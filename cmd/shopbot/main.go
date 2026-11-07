@@ -18,6 +18,7 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres/migrations"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/telegram"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/totp"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
@@ -121,6 +122,16 @@ func main() {
 	})
 
 	service := telegram.NewService(bot, cfg, store, hetznerClient)
+
+	totpVerifier := totp.NewVerifier()
+	if adminSecret := cfg.AdminTotpSecret.Expose(); adminSecret != "" && cfg.AdminTelegramID != 0 {
+		if err := totpVerifier.RegisterSecret(cfg.AdminTelegramID, adminSecret); err != nil {
+			slog.Warn("failed to register admin TOTP secret", "error", err)
+		} else {
+			slog.Info("admin TOTP secret registered", "admin_id", cfg.AdminTelegramID, "issuer", cfg.TotpIssuer)
+		}
+	}
+	service.SetTotpVerifier(totpVerifier)
 
 	billingWorker := billing.NewWorker(store, hetznerClient, service, billing.WorkerConfig{
 		TickInterval: 60 * time.Second,

@@ -20,6 +20,7 @@ type Config struct {
 	DBPassword            secrets.Secret[string]
 	CredentialKEK         secrets.Secret[string]
 	CloudflareTunnelToken secrets.Secret[string]
+	AdminTotpSecret       secrets.Secret[string]
 
 	// Admin and Support
 	AdminTelegramID int64
@@ -131,6 +132,7 @@ func LoadFromEnv() (*Config, error) {
 		DBPassword:            secrets.New(os.Getenv("DB_PASSWORD")),
 		CredentialKEK:         secrets.New(os.Getenv("CREDENTIAL_KEK")),
 		CloudflareTunnelToken: secrets.New(os.Getenv("CLOUDFLARE_TUNNEL_TOKEN")),
+		AdminTotpSecret:       secrets.New(os.Getenv("ADMIN_TOTP_SECRET")),
 
 		AdminTelegramID: getEnvInt64("ADMIN_TELEGRAM_ID", 0),
 		SupportHandle:   getEnvString("SUPPORT_HANDLE", "@manova_support"),

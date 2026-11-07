@@ -43,19 +43,21 @@ type conversationStore interface {
 
 // Service runs the Telegram bot adapter over long polling.
 type Service struct {
-	bot              *telego.Bot
-	cfg              *config.Config
-	store            port.Store
-	provider         port.CloudProvider
-	botUsername      string
-	mu               sync.RWMutex
-	pendingTopups    map[int64]*pendingTopup
-	buyDrafts        map[int64]*buyDraft
-	inFlightBuys     sync.Map
-	inFlightReceipts sync.Map
-	revealMgr        *RevealManager
-	onSendMessage    func(p *telego.SendMessageParams)
-	onSendPhoto      func(p *telego.SendPhotoParams)
+	bot               *telego.Bot
+	cfg               *config.Config
+	store             port.Store
+	provider          port.CloudProvider
+	botUsername       string
+	mu                sync.RWMutex
+	pendingTopups     map[int64]*pendingTopup
+	buyDrafts         map[int64]*buyDraft
+	inFlightBuys      sync.Map
+	inFlightReceipts  sync.Map
+	revealMgr         *RevealManager
+	totp              port.TotpVerifier
+	adminTotpSessions map[int64]time.Time
+	onSendMessage     func(p *telego.SendMessageParams)
+	onSendPhoto       func(p *telego.SendPhotoParams)
 }
 
 func NewService(bot *telego.Bot, cfg *config.Config, store port.Store, provider ...port.CloudProvider) *Service {
@@ -76,14 +78,36 @@ func NewService(bot *telego.Bot, cfg *config.Config, store port.Store, provider 
 	}
 
 	return &Service{
-		bot:           bot,
-		cfg:           cfg,
-		store:         store,
-		provider:      prov,
-		pendingTopups: make(map[int64]*pendingTopup),
-		buyDrafts:     make(map[int64]*buyDraft),
-		revealMgr:     NewRevealManager(kek),
+		bot:               bot,
+		cfg:               cfg,
+		store:             store,
+		provider:          prov,
+		pendingTopups:     make(map[int64]*pendingTopup),
+		buyDrafts:         make(map[int64]*buyDraft),
+		revealMgr:         NewRevealManager(kek),
+		adminTotpSessions: make(map[int64]time.Time),
 	}
+}
+
+// SetTotpVerifier registers the TOTP verifier for admin operations.
+func (s *Service) SetTotpVerifier(v port.TotpVerifier) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.totp = v
+}
+
+// isTotpVerified checks if an admin has an active valid TOTP session.
+func (s *Service) isTotpVerified(adminID int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.adminTotpSessions == nil {
+		return false
+	}
+	exp, ok := s.adminTotpSessions[adminID]
+	if !ok {
+		return false
+	}
+	return time.Now().UTC().Before(exp)
 }
 
 func (s *Service) convStore() conversationStore {
@@ -354,6 +378,15 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 			return nil
 		}
 		return s.handleAdminUserCommand(ctx, chatID, text)
+	}
+
+	// 5.1 Handle /totp command (admin only)
+	if strings.HasPrefix(text, "/totp") {
+		if usr == nil || usr.Role != user.RoleAdmin {
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
+			return nil
+		}
+		return s.handleAdminTotpCommand(ctx, chatID, userID, text)
 	}
 
 	// Unenrolled user attempting other commands
@@ -1739,6 +1772,14 @@ func (s *Service) sendAdminWalletAdjustMenu(ctx context.Context, chatID telego.C
 
 func (s *Service) handleAdminWalletAdjustExec(ctx context.Context, cb *telego.CallbackQuery, targetUserID int64, op string, amountIRT int64) error {
 	chatID := tu.ID(cb.Message.GetChat().ID)
+	if !s.isTotpVerified(cb.From.ID) {
+		if s.bot != nil {
+			_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔐 TOTP authentication required. Please send /totp <6-digit-code> first.").WithShowAlert())
+		}
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "🔐 TOTP authentication required. Please send /totp <6-digit-code> first."))
+		return nil
+	}
+
 	now := time.Now().UTC()
 
 	w, err := s.store.Wallets().GetByUserID(ctx, targetUserID)
@@ -1804,7 +1845,7 @@ func (s *Service) handleAdminWalletAdjustExec(ctx context.Context, cb *telego.Ca
 
 	// 2. Alert admin and return to wallet view
 	confirmMsg := fmt.Sprintf("موجودی با موفقیت بروزرسانی شد. جدید: %s تومان", formatNumber(int64(w.BalanceIRT)))
-	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(confirmMsg))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(confirmMsg))
 
 	return s.sendAdminUserWalletView(ctx, chatID, targetUserID)
 }
@@ -2081,6 +2122,14 @@ func (s *Service) handleAdminUserSetSegment(ctx context.Context, cb *telego.Call
 }
 
 func (s *Service) handleAdminUserSetBlock(ctx context.Context, cb *telego.CallbackQuery, chatID telego.ChatID, targetUserID int64, blocked bool) error {
+	if !s.isTotpVerified(cb.From.ID) {
+		if s.bot != nil {
+			_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔐 TOTP authentication required. Please send /totp <6-digit-code> first.").WithShowAlert())
+		}
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "🔐 TOTP authentication required. Please send /totp <6-digit-code> first."))
+		return nil
+	}
+
 	if targetUserID == s.cfg.AdminTelegramID {
 		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ امکان مسدود کردن مدیر اصلی سیستم وجود ندارد.").WithShowAlert())
 		return nil
@@ -2103,11 +2152,19 @@ func (s *Service) handleAdminUserSetBlock(ctx context.Context, cb *telego.Callba
 	} else {
 		toast = "مسدودیت کاربر لغو شد."
 	}
-	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(toast))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(toast))
 	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
 }
 
 func (s *Service) handleAdminUserSetRole(ctx context.Context, cb *telego.CallbackQuery, chatID telego.ChatID, targetUserID int64, roleStr string) error {
+	if !s.isTotpVerified(cb.From.ID) {
+		if s.bot != nil {
+			_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔐 TOTP authentication required. Please send /totp <6-digit-code> first.").WithShowAlert())
+		}
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "🔐 TOTP authentication required. Please send /totp <6-digit-code> first."))
+		return nil
+	}
+
 	if targetUserID == s.cfg.AdminTelegramID && roleStr != "admin" {
 		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ امکان تنزل مقام مدیر اصلی سیستم وجود ندارد.").WithShowAlert())
 		return nil
@@ -2129,7 +2186,7 @@ func (s *Service) handleAdminUserSetRole(ctx context.Context, cb *telego.Callbac
 		return err
 	}
 
-	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("نقش کاربر به %s تغییر یافت.", role)))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("نقش کاربر به %s تغییر یافت.", role)))
 	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
 }
 
@@ -2145,7 +2202,7 @@ func (s *Service) handleAdminUserResetPhone(ctx context.Context, cb *telego.Call
 		return err
 	}
 
-	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("تایید شماره همراه کاربر ریست شد."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("تایید شماره همراه کاربر ریست شد."))
 	return s.sendAdminUserDetailView(ctx, chatID, targetUserID)
 }
 
@@ -2162,4 +2219,38 @@ func (s *Service) handleAdminUserCommand(ctx context.Context, chatID telego.Chat
 	}
 
 	return s.sendAdminUserDetailView(ctx, chatID, targetUID)
+}
+
+func (s *Service) handleAdminTotpCommand(ctx context.Context, chatID telego.ChatID, adminID int64, text string) error {
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ Invalid TOTP code."))
+		return nil
+	}
+
+	code := parts[1]
+	s.mu.RLock()
+	totpVerifier := s.totp
+	s.mu.RUnlock()
+
+	if totpVerifier == nil {
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ Invalid TOTP code."))
+		return nil
+	}
+
+	valid, err := totpVerifier.VerifyCode(ctx, adminID, code)
+	if err != nil || !valid {
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ Invalid TOTP code."))
+		return nil
+	}
+
+	s.mu.Lock()
+	if s.adminTotpSessions == nil {
+		s.adminTotpSessions = make(map[int64]time.Time)
+	}
+	s.adminTotpSessions[adminID] = time.Now().UTC().Add(15 * time.Minute)
+	s.mu.Unlock()
+
+	_, _ = s.sendMessage(ctx, tu.Message(chatID, "✅ TOTP verified. Admin session active for 15 minutes."))
+	return nil
 }
