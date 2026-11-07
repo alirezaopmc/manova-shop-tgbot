@@ -60,6 +60,22 @@ func (s *Service) sendUserServersList(ctx context.Context, chatID telego.ChatID,
 	return err
 }
 
+// checkServerOwnership validates that the user owns the server or is an administrator.
+func (s *Service) checkServerOwnership(ctx context.Context, chatID int64, userID int64, res *billing.ProvisionedResource) (bool, error) {
+	if res != nil && res.UserID == userID {
+		return true, nil
+	}
+	usr, err := s.store.Users().GetByID(ctx, userID)
+	if err == nil && usr != nil && usr.Role == user.RoleAdmin {
+		return true, nil
+	}
+	if s.cfg != nil && s.cfg.AdminTelegramID != 0 && userID == s.cfg.AdminTelegramID {
+		return true, nil
+	}
+	_ = s.sendAccessDenied(ctx, tu.ID(chatID))
+	return false, nil
+}
+
 // Server management view for a specific server
 func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.ChatID, resID string, userID int64) error {
 	res, err := s.store.Billing().GetResource(ctx, resID)
@@ -69,9 +85,8 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 	}
 
 	// Verify ownership or admin
-	usr, _ := s.store.Users().GetByID(ctx, userID)
-	if res.UserID != userID && (usr == nil || usr.Role != user.RoleAdmin) {
-		return s.sendAccessDenied(ctx, chatID)
+	if ok, err := s.checkServerOwnership(ctx, chatID.ID, userID, res); !ok {
+		return err
 	}
 
 	stateLabel := "🟢 Running"
@@ -152,6 +167,11 @@ func (s *Service) handleServerPowerOn(ctx context.Context, cb *telego.CallbackQu
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	_ = s.provider.PowerOn(ctx, res.ExternalID)
 	res.PowerState = billing.PowerStateRunning
 	_ = s.store.Billing().SaveResource(ctx, res)
@@ -166,6 +186,11 @@ func (s *Service) handleServerPowerOff(ctx context.Context, cb *telego.CallbackQ
 	if err != nil || res == nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("سرور یافت نشد."))
 		return nil
+	}
+
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
 	}
 
 	_ = s.provider.PowerOff(ctx, res.ExternalID)
@@ -184,6 +209,11 @@ func (s *Service) handleServerReboot(ctx context.Context, cb *telego.CallbackQue
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	_ = s.provider.Reboot(ctx, res.ExternalID)
 	res.PowerState = billing.PowerStateRunning
 	_ = s.store.Billing().SaveResource(ctx, res)
@@ -198,6 +228,11 @@ func (s *Service) handleServerResetPassword(ctx context.Context, cb *telego.Call
 	if err != nil || res == nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("سرور یافت نشد."))
 		return nil
+	}
+
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
 	}
 
 	newPwd, err := s.provider.ResetPassword(ctx, res.ExternalID)
@@ -227,6 +262,11 @@ func (s *Service) handleServerRescue(ctx context.Context, cb *telego.CallbackQue
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	rescuePwd, err := s.provider.EnableRescue(ctx, res.ExternalID)
 	if err != nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("Error enabling rescue mode."))
@@ -247,6 +287,10 @@ func (s *Service) handleServerDeletePrompt(ctx context.Context, chatID telego.Ch
 	res, err := s.store.Billing().GetResource(ctx, resID)
 	if err != nil || res == nil {
 		return s.sendUserServersList(ctx, chatID, userID)
+	}
+
+	if ok, err := s.checkServerOwnership(ctx, chatID.ID, userID, res); !ok {
+		return err
 	}
 
 	text := fmt.Sprintf(
@@ -274,6 +318,11 @@ func (s *Service) handleServerDeleteConfirm(ctx context.Context, cb *telego.Call
 	if err != nil || res == nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("سرور قبلاً حذف شده است."))
 		return s.sendUserServersList(ctx, chatID, userID)
+	}
+
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
 	}
 
 	_ = s.provider.DeleteServer(ctx, res.ExternalID)

@@ -1002,14 +1002,18 @@ func (s *Service) sendSupport(ctx context.Context, chatID telego.ChatID) error {
 }
 
 func (s *Service) sendAccessDenied(ctx context.Context, chatID telego.ChatID) error {
+	supportHandle := ""
+	if s.cfg != nil {
+		supportHandle = s.cfg.SupportHandle
+	}
 	text := fmt.Sprintf(
 		"🔒 <b>ورود اختصاصی با دعوت‌نامه</b>\n\n"+
 			"دسترسی به خدمات فروشگاه مانوا در فاز خصوصی فقط با داشتن لینک دعوت امکان‌پذیر است.\n\n"+
 			"اگر لینک دعوت دارید، لطفاً روی لینک خود کلیک کرده و دکمه Start را بزنید.\n"+
 			"پشتیبانی: %s",
-		s.cfg.SupportHandle,
+		supportHandle,
 	)
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML))
 	return err
 }
 
