@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -129,13 +130,13 @@ func main() {
 	})
 
 	go func() {
-		if err := billingWorker.Run(ctx); err != nil && err != context.Canceled {
+		if err := billingWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Error("billing worker stopped with error", "error", err)
 		}
 	}()
 
 	go func() {
-		if err := service.Start(ctx); err != nil && err != context.Canceled {
+		if err := service.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Error("telegram service stopped with error", "error", err)
 		}
 	}()

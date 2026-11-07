@@ -101,6 +101,26 @@ func (w *Worker) ProcessMinuteTick(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("list active resources: %w", err)
 	}
 
+	if len(resources) == 0 {
+		return nil
+	}
+
+	var obs pricing.RateObservation
+	var sellRate pricing.IRT
+	if w.store.FxRates() != nil {
+		var err error
+		obs, err = w.store.FxRates().FetchRate(ctx)
+		if err != nil {
+			w.cfg.Logger.Error("failed to fetch fx rate for billing tick", "error", err)
+			return fmt.Errorf("fetch fx rate: %w", err)
+		}
+		sellRate = pricing.CalculateSellRate(obs.MarketIRTPerUSD, w.cfg.SpreadIRT)
+		if sellRate <= 0 {
+			w.cfg.Logger.Error("invalid sell rate for billing tick", "market_rate", obs.MarketIRTPerUSD, "spread", w.cfg.SpreadIRT)
+			return errors.New("invalid sell rate")
+		}
+	}
+
 	for i := range resources {
 		res := &resources[i]
 		if res.Status != ResourceStatusActive {
@@ -113,18 +133,6 @@ func (w *Worker) ProcessMinuteTick(ctx context.Context, now time.Time) error {
 
 		elapsedMinutes := int64(now.Sub(res.BillingStartAt) / time.Minute)
 		if elapsedMinutes <= res.PostedThroughMinute {
-			continue
-		}
-
-		obs, err := w.store.FxRates().FetchRate(ctx)
-		if err != nil {
-			w.cfg.Logger.Error("failed to fetch fx rate for billing", "error", err, "resource_id", res.ID)
-			continue
-		}
-
-		sellRate := pricing.CalculateSellRate(obs.MarketIRTPerUSD, w.cfg.SpreadIRT)
-		if sellRate <= 0 {
-			w.cfg.Logger.Error("invalid sell rate for billing", "market_rate", obs.MarketIRTPerUSD, "spread", w.cfg.SpreadIRT, "resource_id", res.ID)
 			continue
 		}
 
@@ -203,16 +211,21 @@ func (w *Worker) ProcessMinuteTick(ctx context.Context, now time.Time) error {
 }
 
 func (w *Worker) handleDepletedBalance(ctx context.Context, res *ProvisionedResource, now time.Time) {
+	var sendWarning bool
 	w.mu.Lock()
 	breachAt, exists := w.breaches[res.ID]
 	if !exists {
 		w.breaches[res.ID] = now
 		breachAt = now
-		if w.cfg.GracePeriod > 0 && w.notifier != nil {
-			_ = w.notifier.SendUserMessage(ctx, res.UserID, fmt.Sprintf("⚠️ Wallet balance depleted for server %s. Please top up within %v to avoid shutdown.", res.ServerName, w.cfg.GracePeriod))
+		if w.cfg.GracePeriod > 0 && w.notifier != nil && res.PowerState != PowerStateOff {
+			sendWarning = true
 		}
 	}
 	w.mu.Unlock()
+
+	if sendWarning && w.notifier != nil {
+		_ = w.notifier.SendUserMessage(ctx, res.UserID, fmt.Sprintf("⚠️ Wallet balance depleted for server %s. Please top up within %v to avoid shutdown.", res.ServerName, w.cfg.GracePeriod))
+	}
 
 	graceExceeded := w.cfg.GracePeriod <= 0 || !now.Before(breachAt.Add(w.cfg.GracePeriod))
 	if graceExceeded {
