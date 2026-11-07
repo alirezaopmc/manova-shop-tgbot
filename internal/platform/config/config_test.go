@@ -8,13 +8,35 @@ import (
 )
 
 func TestConfigDefaults(t *testing.T) {
+	os.Setenv("SHOPBOT_NO_DOTENV", "1")
+	defer os.Unsetenv("SHOPBOT_NO_DOTENV")
+
+	varsToClear := []string{
+		"ADMIN_TELEGRAM_ID",
+		"CARD_HOLDER_NAME",
+		"TELEGRAM_BOT_TOKEN",
+		"HCLOUD_TOKEN",
+		"DB_PASSWORD",
+		"CREDENTIAL_KEK",
+	}
+	for _, v := range varsToClear {
+		if old, ok := os.LookupEnv(v); ok {
+			defer os.Setenv(v, old)
+			os.Unsetenv(v)
+		}
+	}
+
 	cfg, err := LoadFromEnv()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.AdminTelegramID != 6246642516 {
-		t.Fatalf("expected admin ID 6246642516, got %d", cfg.AdminTelegramID)
+	if cfg.AdminTelegramID != 0 {
+		t.Fatalf("expected admin ID 0, got %d", cfg.AdminTelegramID)
+	}
+
+	if cfg.CardHolderName != "" {
+		t.Fatalf("expected empty card holder name, got %q", cfg.CardHolderName)
 	}
 
 	if cfg.RateSpreadIRTPerUSD != 5000 {
@@ -36,6 +58,7 @@ func TestConfigDefaults(t *testing.T) {
 
 func TestConfigEnvOverrides(t *testing.T) {
 	os.Setenv("ADMIN_TELEGRAM_ID", "999888777")
+	os.Setenv("CARD_HOLDER_NAME", "Jane Doe")
 	os.Setenv("WARN_RUNWAY_HOURS", "48, 12, 2")
 	os.Setenv("TELEGRAM_BOT_TOKEN", "mock-token")
 	os.Setenv("HCLOUD_TOKEN", "mock-hcloud")
@@ -43,6 +66,7 @@ func TestConfigEnvOverrides(t *testing.T) {
 	os.Setenv("CREDENTIAL_KEK", "mock-kek")
 	defer func() {
 		os.Unsetenv("ADMIN_TELEGRAM_ID")
+		os.Unsetenv("CARD_HOLDER_NAME")
 		os.Unsetenv("WARN_RUNWAY_HOURS")
 		os.Unsetenv("TELEGRAM_BOT_TOKEN")
 		os.Unsetenv("HCLOUD_TOKEN")
@@ -59,12 +83,79 @@ func TestConfigEnvOverrides(t *testing.T) {
 		t.Fatalf("expected 999888777, got %d", cfg.AdminTelegramID)
 	}
 
+	if cfg.CardHolderName != "Jane Doe" {
+		t.Fatalf("expected Jane Doe, got %s", cfg.CardHolderName)
+	}
+
 	if len(cfg.WarnRunwayHours) != 3 || cfg.WarnRunwayHours[0] != 48 {
 		t.Fatalf("expected overridden runway hours, got %v", cfg.WarnRunwayHours)
 	}
 
 	if err := cfg.ValidateProduction(); err != nil {
 		t.Fatalf("expected validation to pass when secrets are set: %v", err)
+	}
+}
+
+func TestValidateProduction(t *testing.T) {
+	validCfg := func() *Config {
+		return &Config{
+			TelegramBotToken: secrets.New("tg-tok"),
+			HCloudToken:      secrets.New("hc-tok"),
+			DBPassword:       secrets.New("db-pass"),
+			CredentialKEK:    secrets.New("kek-val"),
+			AdminTelegramID:  123456789,
+			CardHolderName:   "Admin User",
+		}
+	}
+
+	// Valid config passes
+	if err := validCfg().ValidateProduction(); err != nil {
+		t.Fatalf("expected valid config to pass, got: %v", err)
+	}
+
+	// AdminTelegramID zero or negative fails
+	cfg := validCfg()
+	cfg.AdminTelegramID = 0
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when AdminTelegramID is 0")
+	}
+
+	cfg = validCfg()
+	cfg.AdminTelegramID = -10
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when AdminTelegramID is negative")
+	}
+
+	// CardHolderName empty fails
+	cfg = validCfg()
+	cfg.CardHolderName = ""
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when CardHolderName is empty")
+	}
+
+	// Missing secrets fail
+	cfg = validCfg()
+	cfg.TelegramBotToken = secrets.New("")
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when TelegramBotToken is empty")
+	}
+
+	cfg = validCfg()
+	cfg.HCloudToken = secrets.New("")
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when HCloudToken is empty")
+	}
+
+	cfg = validCfg()
+	cfg.DBPassword = secrets.New("")
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when DBPassword is empty")
+	}
+
+	cfg = validCfg()
+	cfg.CredentialKEK = secrets.New("")
+	if err := cfg.ValidateProduction(); err == nil {
+		t.Fatalf("expected error when CredentialKEK is empty")
 	}
 }
 

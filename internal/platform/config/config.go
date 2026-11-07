@@ -132,10 +132,10 @@ func LoadFromEnv() (*Config, error) {
 		CredentialKEK:         secrets.New(os.Getenv("CREDENTIAL_KEK")),
 		CloudflareTunnelToken: secrets.New(os.Getenv("CLOUDFLARE_TUNNEL_TOKEN")),
 
-		AdminTelegramID: getEnvInt64("ADMIN_TELEGRAM_ID", 6246642516),
+		AdminTelegramID: getEnvInt64("ADMIN_TELEGRAM_ID", 0),
 		SupportHandle:   getEnvString("SUPPORT_HANDLE", "@manova_support"),
 		TotpIssuer:      getEnvString("TOTP_ISSUER", "shop_manovabot"),
-		CardHolderName:  getEnvString("CARD_HOLDER_NAME", "Alireza Jafartash"),
+		CardHolderName:  getEnvString("CARD_HOLDER_NAME", ""),
 
 		DatabaseURL: getEnvString("DATABASE_URL", ""),
 		DBHost:      getEnvString("DATABASE_HOST", ""),
@@ -183,7 +183,7 @@ func LoadFromEnv() (*Config, error) {
 	return cfg, nil
 }
 
-// ValidateProduction checks that critical secrets are set when running in production mode.
+// ValidateProduction checks that critical secrets and settings are set when running in production mode.
 func (c *Config) ValidateProduction() error {
 	var missing []string
 	if c.TelegramBotToken.IsZero() {
@@ -198,8 +198,14 @@ func (c *Config) ValidateProduction() error {
 	if c.CredentialKEK.IsZero() {
 		missing = append(missing, "CREDENTIAL_KEK")
 	}
+	if c.AdminTelegramID <= 0 {
+		missing = append(missing, "ADMIN_TELEGRAM_ID")
+	}
+	if c.CardHolderName == "" {
+		missing = append(missing, "CARD_HOLDER_NAME")
+	}
 	if len(missing) > 0 {
-		return errors.New("missing required secrets in production: " + strings.Join(missing, ", "))
+		return errors.New("missing required configuration in production: " + strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -281,6 +287,9 @@ func (c *Config) RateMaxAgeDuration() time.Duration {
 
 // loadDotEnvFiles reads KEY=VALUE pairs from files if they exist and sets them into the environment.
 func loadDotEnvFiles(paths ...string) {
+	if os.Getenv("SHOPBOT_NO_DOTENV") != "" {
+		return
+	}
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {

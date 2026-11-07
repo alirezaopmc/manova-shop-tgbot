@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,15 +20,26 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/secrets"
 )
 
 const defaultBaseURL = "https://api.hetzner.cloud/v1"
 
 var (
-	ErrServerNotFound   = errors.New("hetzner server not found")
-	ErrProviderAPIError = errors.New("hetzner api returned an error")
-	ErrMissingToken     = errors.New("Hetzner Cloud API token is not configured (HCLOUD_TOKEN is empty). Please set HCLOUD_TOKEN in /etc/manova/shop-tgbot/shopbot.env")
+	ErrServerNotFound    = errors.New("hetzner server not found")
+	ErrProviderAPIError  = errors.New("hetzner api returned an error")
+	ErrMissingToken      = errors.New("Hetzner Cloud API token is not configured (HCLOUD_TOKEN is empty). Please set HCLOUD_TOKEN in /etc/manova/shop-tgbot/shopbot.env")
+	ErrInvalidExternalID = errors.New("invalid external ID: must contain only digits")
 )
+
+var numericIDRegex = regexp.MustCompile(`^[0-9]+$`)
+
+func validateExternalID(externalID string) error {
+	if !numericIDRegex.MatchString(externalID) {
+		return fmt.Errorf("%w: %q", ErrInvalidExternalID, externalID)
+	}
+	return nil
+}
 
 type resourceCache struct {
 	serverTypes   []port.ProviderServerType
@@ -58,7 +70,7 @@ type simulatedServer struct {
 // Client implements port.CloudProvider against Hetzner Cloud API,
 // with 1-minute caching for catalog resources and strict production validation.
 type Client struct {
-	token          string
+	token          secrets.Secret[string]
 	baseURL        string
 	httpClient     *http.Client
 	logger         *slog.Logger
@@ -71,8 +83,9 @@ type Client struct {
 }
 
 // Config holds settings for Hetzner Cloud client.
+// Token accepts either secrets.Secret[string] or string.
 type Config struct {
-	Token          string
+	Token          any
 	BaseURL        string
 	HTTPClient     *http.Client
 	Logger         *slog.Logger
@@ -94,8 +107,16 @@ func NewClient(cfg Config) *Client {
 		logger = slog.Default()
 	}
 
+	var tok secrets.Secret[string]
+	switch v := cfg.Token.(type) {
+	case secrets.Secret[string]:
+		tok = v
+	case string:
+		tok = secrets.New(v)
+	}
+
 	c := &Client{
-		token:          cfg.Token,
+		token:          tok,
 		baseURL:        baseURL,
 		httpClient:     httpClient,
 		logger:         logger,
@@ -112,7 +133,7 @@ func (c *Client) isSimulated() bool {
 
 // HasToken checks if API token is configured or running in simulation mode.
 func (c *Client) HasToken() bool {
-	return c.simulationMode || c.token != ""
+	return c.simulationMode || !c.token.IsZero()
 }
 
 // ListServerTypes returns available server types with a 1-minute cache.
@@ -126,10 +147,10 @@ func (c *Client) ListServerTypes(ctx context.Context) ([]port.ProviderServerType
 	c.mu.RUnlock()
 
 	// If token present, fetch live from Hetzner API
-	if c.token != "" {
+	if !c.token.IsZero() {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/server_types", nil)
 		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+c.token)
+			req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 			resp, err := c.httpClient.Do(req)
 			if err == nil {
 				defer resp.Body.Close()
@@ -188,10 +209,10 @@ func (c *Client) ListLocations(ctx context.Context) ([]port.ProviderLocation, er
 	}
 	c.mu.RUnlock()
 
-	if c.token != "" {
+	if !c.token.IsZero() {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/locations", nil)
 		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+c.token)
+			req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 			resp, err := c.httpClient.Do(req)
 			if err == nil {
 				defer resp.Body.Close()
@@ -247,11 +268,11 @@ func (c *Client) ListImages(ctx context.Context) ([]port.ProviderImage, error) {
 	}
 	c.mu.RUnlock()
 
-	if c.token != "" {
+	if !c.token.IsZero() {
 		url := c.baseURL + "/images?type=system&architecture=x86"
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+c.token)
+			req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 			resp, err := c.httpClient.Do(req)
 			if err == nil {
 				defer resp.Body.Close()
@@ -308,7 +329,7 @@ func (c *Client) EnsureSSHKey(ctx context.Context, name string, publicKey string
 	if c.isSimulated() {
 		return name, nil
 	}
-	if c.token == "" {
+	if c.token.IsZero() {
 		return "", ErrMissingToken
 	}
 
@@ -323,7 +344,7 @@ func (c *Client) EnsureSSHKey(ctx context.Context, name string, publicKey string
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -357,7 +378,7 @@ func (c *Client) EnsureSSHKey(ctx context.Context, name string, publicKey string
 	if errResp.Error.Code == "uniqueness_error" {
 		listReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/ssh_keys", nil)
 		if err == nil {
-			listReq.Header.Set("Authorization", "Bearer "+c.token)
+			listReq.Header.Set("Authorization", "Bearer "+c.token.Expose())
 			if listResp, err := c.httpClient.Do(listReq); err == nil {
 				defer listResp.Body.Close()
 				var listRes struct {
@@ -390,7 +411,7 @@ func (c *Client) CreateServer(ctx context.Context, name string, serverType strin
 		return c.createSimulatedServer(name, serverType, imageName, location, len(sshKeyIDs) > 0)
 	}
 
-	if c.token == "" {
+	if c.token.IsZero() {
 		return nil, ErrMissingToken
 	}
 
@@ -430,7 +451,7 @@ func (c *Client) CreateServer(ctx context.Context, name string, serverType strin
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -506,11 +527,15 @@ func (c *Client) CreateServer(ctx context.Context, name string, serverType strin
 
 // GetServer fetches server status.
 func (c *Client) GetServer(ctx context.Context, externalID string) (*port.ProviderServerStatus, error) {
+	if err := validateExternalID(externalID); err != nil {
+		return nil, err
+	}
+
 	if c.isSimulated() {
 		return c.getSimulatedServer(externalID)
 	}
 
-	if c.token == "" {
+	if c.token.IsZero() {
 		return nil, ErrMissingToken
 	}
 
@@ -518,7 +543,7 @@ func (c *Client) GetServer(ctx context.Context, externalID string) (*port.Provid
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -570,6 +595,10 @@ func (c *Client) GetServer(ctx context.Context, externalID string) (*port.Provid
 
 // DeleteServer deletes server.
 func (c *Client) DeleteServer(ctx context.Context, externalID string) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
+
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -577,7 +606,7 @@ func (c *Client) DeleteServer(ctx context.Context, externalID string) error {
 		return nil
 	}
 
-	if c.token == "" {
+	if c.token.IsZero() {
 		return ErrMissingToken
 	}
 
@@ -585,7 +614,7 @@ func (c *Client) DeleteServer(ctx context.Context, externalID string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -602,6 +631,9 @@ func (c *Client) DeleteServer(ctx context.Context, externalID string) error {
 
 // PowerOn powers on a server.
 func (c *Client) PowerOn(ctx context.Context, externalID string) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -616,6 +648,9 @@ func (c *Client) PowerOn(ctx context.Context, externalID string) error {
 
 // PowerOff powers off a server.
 func (c *Client) PowerOff(ctx context.Context, externalID string) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -630,6 +665,9 @@ func (c *Client) PowerOff(ctx context.Context, externalID string) error {
 
 // Shutdown gracefully shuts down server.
 func (c *Client) Shutdown(ctx context.Context, externalID string) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
 	if c.isSimulated() {
 		return c.PowerOff(ctx, externalID)
 	}
@@ -638,6 +676,9 @@ func (c *Client) Shutdown(ctx context.Context, externalID string) error {
 
 // Reboot restarts a server.
 func (c *Client) Reboot(ctx context.Context, externalID string) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -652,6 +693,9 @@ func (c *Client) Reboot(ctx context.Context, externalID string) error {
 
 // ResetPassword resets the root password of server.
 func (c *Client) ResetPassword(ctx context.Context, externalID string) (string, error) {
+	if err := validateExternalID(externalID); err != nil {
+		return "", err
+	}
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -678,6 +722,9 @@ func (c *Client) ResetPassword(ctx context.Context, externalID string) (string, 
 
 // EnableRescue enables the Hetzner rescue system.
 func (c *Client) EnableRescue(ctx context.Context, externalID string) (string, error) {
+	if err := validateExternalID(externalID); err != nil {
+		return "", err
+	}
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -705,6 +752,9 @@ func (c *Client) EnableRescue(ctx context.Context, externalID string) (string, e
 
 // DisableRescue disables rescue mode.
 func (c *Client) DisableRescue(ctx context.Context, externalID string) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
 	if c.isSimulated() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -717,12 +767,18 @@ func (c *Client) DisableRescue(ctx context.Context, externalID string) error {
 }
 
 func (c *Client) postAction(ctx context.Context, externalID, action string, payload any) error {
+	if err := validateExternalID(externalID); err != nil {
+		return err
+	}
 	_, err := c.postActionWithResponse(ctx, externalID, action, payload)
 	return err
 }
 
 func (c *Client) postActionWithResponse(ctx context.Context, externalID, action string, payload any) ([]byte, error) {
-	if c.token == "" {
+	if err := validateExternalID(externalID); err != nil {
+		return nil, err
+	}
+	if c.token.IsZero() {
 		return nil, ErrMissingToken
 	}
 
@@ -737,7 +793,7 @@ func (c *Client) postActionWithResponse(ctx context.Context, externalID, action 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -763,6 +819,27 @@ func (c *Client) postActionWithResponse(ctx context.Context, externalID, action 
 		return nil, fmt.Errorf("%w: status %d", ErrProviderAPIError, resp.StatusCode)
 	}
 	return data, nil
+}
+
+// Server management aliases for explicit nomenclature compatibility.
+func (c *Client) PowerOnServer(ctx context.Context, externalID string) error {
+	return c.PowerOn(ctx, externalID)
+}
+
+func (c *Client) PowerOffServer(ctx context.Context, externalID string) error {
+	return c.PowerOff(ctx, externalID)
+}
+
+func (c *Client) RebootServer(ctx context.Context, externalID string) error {
+	return c.Reboot(ctx, externalID)
+}
+
+func (c *Client) ResetRootPassword(ctx context.Context, externalID string) (string, error) {
+	return c.ResetPassword(ctx, externalID)
+}
+
+func (c *Client) GetServerStatus(ctx context.Context, externalID string) (*port.ProviderServerStatus, error) {
+	return c.GetServer(ctx, externalID)
 }
 
 // Simulated helpers (used ONLY when SimulationMode: true in unit tests)
