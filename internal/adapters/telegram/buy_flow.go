@@ -20,6 +20,7 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/crypto"
 )
 
 type buyDraft struct {
@@ -547,6 +548,15 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	}
 
 	// 4. Save ProvisionedResource
+	rootPasswordToSave := createResult.RootPassword
+	if s.cfg != nil && !s.cfg.CredentialKEK.IsZero() && s.cfg.CredentialKEK.Expose() != "" && createResult.RootPassword != "" {
+		if encPwd, err := crypto.Encrypt(createResult.RootPassword, s.cfg.CredentialKEK.Expose()); err == nil {
+			rootPasswordToSave = encPwd
+		} else {
+			slog.Error("failed to encrypt root password", "err", err)
+		}
+	}
+
 	resID := fmt.Sprintf("res-%d", time.Now().UnixNano())
 	res := &billing.ProvisionedResource{
 		ID:             resID,
@@ -562,7 +572,7 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		IPv6Address:    createResult.IPv6Address,
 		Location:       location,
 		ImageName:      osImage,
-		RootPassword:   createResult.RootPassword,
+		RootPassword:   rootPasswordToSave,
 		SSHKey:         savedSSHKey,
 		BillingStartAt: time.Now().UTC(),
 		CreatedAt:      time.Now().UTC(),
@@ -586,7 +596,12 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	if accessMode == "ssh" {
 		credsSection = "• Auth: <b>SSH Key</b>\n• Username: <code>root</code>"
 	} else {
-		credsSection = fmt.Sprintf("• Username: <code>root</code>\n• Root Password:\n<code>%s</code>", html.EscapeString(createResult.RootPassword))
+		revealURL := s.generateRevealURL(createResult.RootPassword)
+		if revealURL != "" {
+			credsSection = fmt.Sprintf("• Username: <code>root</code>\n• 🔑 One-time Password: <a href=\"%s\">Click to reveal</a> (Valid 15m)", revealURL)
+		} else {
+			credsSection = "• Username: <code>root</code>\n• 🔑 One-time Password: <i>Generated</i>"
+		}
 	}
 
 	successText := fmt.Sprintf(

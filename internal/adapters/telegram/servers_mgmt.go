@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"log/slog"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/crypto"
 )
 
 // List user's active servers
@@ -99,7 +101,7 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 	if res.SSHKey != "" {
 		accessInfo = "🛡️ <b>SSH Key</b>"
 	} else if res.RootPassword != "" {
-		accessInfo = fmt.Sprintf("🔑 <b>Root Password:</b> <code>%s</code>", html.EscapeString(res.RootPassword))
+		accessInfo = "🔑 <b>Root Password:</b> <code>[Encrypted/Set]</code>"
 	} else {
 		accessInfo = "🔑 <i>Password generated (use Reset Password if needed)</i>"
 	}
@@ -242,15 +244,32 @@ func (s *Service) handleServerResetPassword(ctx context.Context, cb *telego.Call
 		return nil
 	}
 
-	res.RootPassword = newPwd
+	rootPasswordToSave := newPwd
+	if s.cfg != nil && !s.cfg.CredentialKEK.IsZero() && s.cfg.CredentialKEK.Expose() != "" && newPwd != "" {
+		if encPwd, err := crypto.Encrypt(newPwd, s.cfg.CredentialKEK.Expose()); err == nil {
+			rootPasswordToSave = encPwd
+		} else {
+			slog.Error("failed to encrypt reset root password", "err", err)
+		}
+	}
+	res.RootPassword = rootPasswordToSave
 	_ = s.store.Billing().SaveResource(ctx, res)
 
 	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔑 Root password reset."))
 
-	notice := fmt.Sprintf(
-		"🔑 <b>New Root Password (%s):</b>\n<code>%s</code>",
-		html.EscapeString(res.ServerName), html.EscapeString(newPwd),
-	)
+	revealURL := s.generateRevealURL(newPwd)
+	var notice string
+	if revealURL != "" {
+		notice = fmt.Sprintf(
+			"🔑 <b>New Root Password (%s):</b>\n<a href=\"%s\">Click to reveal</a> (Valid 15m)",
+			html.EscapeString(res.ServerName), revealURL,
+		)
+	} else {
+		notice = fmt.Sprintf(
+			"🔑 <b>New Root Password (%s):</b>\n<code>[Encrypted/Set]</code>",
+			html.EscapeString(res.ServerName),
+		)
+	}
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }
@@ -276,10 +295,19 @@ func (s *Service) handleServerRescue(ctx context.Context, cb *telego.CallbackQue
 
 	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🛟 Rescue mode enabled."))
 
-	notice := fmt.Sprintf(
-		"🛟 <b>Rescue Mode enabled (%s):</b>\n<code>%s</code>\n\nReboot server to boot into rescue system.",
-		html.EscapeString(res.ServerName), html.EscapeString(rescuePwd),
-	)
+	revealURL := s.generateRevealURL(rescuePwd)
+	var notice string
+	if revealURL != "" {
+		notice = fmt.Sprintf(
+			"🛟 <b>Rescue Mode enabled (%s):</b>\n🔑 One-time Password: <a href=\"%s\">Click to reveal</a> (Valid 15m)\n\nReboot server to boot into rescue system.",
+			html.EscapeString(res.ServerName), revealURL,
+		)
+	} else {
+		notice = fmt.Sprintf(
+			"🛟 <b>Rescue Mode enabled (%s):</b>\n\nReboot server to boot into rescue system.",
+			html.EscapeString(res.ServerName),
+		)
+	}
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }

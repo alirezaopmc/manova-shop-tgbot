@@ -53,6 +53,7 @@ type Service struct {
 	buyDrafts        map[int64]*buyDraft
 	inFlightBuys     sync.Map
 	inFlightReceipts sync.Map
+	revealMgr        *RevealManager
 	onSendMessage    func(p *telego.SendMessageParams)
 	onSendPhoto      func(p *telego.SendPhotoParams)
 }
@@ -69,6 +70,11 @@ func NewService(bot *telego.Bot, cfg *config.Config, store port.Store, provider 
 		prov = hetzner.NewClient(hetzner.Config{})
 	}
 
+	var kek string
+	if cfg != nil && !cfg.CredentialKEK.IsZero() {
+		kek = cfg.CredentialKEK.Expose()
+	}
+
 	return &Service{
 		bot:           bot,
 		cfg:           cfg,
@@ -76,6 +82,7 @@ func NewService(bot *telego.Bot, cfg *config.Config, store port.Store, provider 
 		provider:      prov,
 		pendingTopups: make(map[int64]*pendingTopup),
 		buyDrafts:     make(map[int64]*buyDraft),
+		revealMgr:     NewRevealManager(kek),
 	}
 }
 

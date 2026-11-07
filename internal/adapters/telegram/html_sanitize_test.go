@@ -241,12 +241,16 @@ func TestHTMLSanitization_ServerDetailView(t *testing.T) {
 		"ubuntu-24.04&lt;script&gt;",
 		"192.168.1.1&lt;phish&gt;",
 		"2001:db8::1&lt;script&gt;",
-		"p@ss&lt;w&amp;o&#34;rd&gt;",
+		"[Encrypted/Set]",
 	}
 	for _, e := range requiredEntities {
 		if !strings.Contains(capturedText, e) {
 			t.Errorf("server management view missing escaped entity %q: %s", e, capturedText)
 		}
+	}
+
+	if strings.Contains(capturedText, "p@ss") {
+		t.Errorf("server management view must not expose root password: %s", capturedText)
 	}
 }
 
