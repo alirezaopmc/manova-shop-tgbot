@@ -131,37 +131,6 @@ func TestSubRepositoryStubsReturnNotImplemented(t *testing.T) {
 	s := NewStore(nil)
 	ctx := context.Background()
 
-	// Users
-	if _, err := s.Users().GetByID(ctx, 123); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Users().GetByID, got %v", err)
-	}
-	if _, err := s.Users().FindByPhoneHash(ctx, "hash"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Users().FindByPhoneHash, got %v", err)
-	}
-	if err := s.Users().Save(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Users().Save, got %v", err)
-	}
-	if _, err := s.Users().Count(ctx); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Users().Count, got %v", err)
-	}
-	if _, err := s.Users().ListUsers(ctx, 10); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Users().ListUsers, got %v", err)
-	}
-
-	// Invites
-	if err := s.Invites().Create(ctx, nil); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Invites().Create, got %v", err)
-	}
-	if _, err := s.Invites().GetByCode(ctx, "code"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Invites().GetByCode, got %v", err)
-	}
-	if _, err := s.Invites().Claim(ctx, "code", 1, time.Now()); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Invites().Claim, got %v", err)
-	}
-	if _, err := s.Invites().ListByCreator(ctx, 1); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented from Invites().ListByCreator, got %v", err)
-	}
-
 	// Wallets
 	if _, err := s.Wallets().GetByUserID(ctx, 1); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("expected ErrNotImplemented from Wallets().GetByUserID, got %v", err)

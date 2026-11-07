@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres/migrations"
 )
 
 // getTestDatabaseURL returns the test PostgreSQL connection URL from environment
@@ -62,6 +64,15 @@ func openTestPool(t testing.TB) *pgxpool.Pool {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	m, err := migrations.Open(dsn)
+	if err != nil {
+		t.Fatalf("failed to open migrator: %v", err)
+	}
+	defer m.Close()
+	if err := m.Up(ctx); err != nil {
+		t.Fatalf("failed to apply migrations in test: %v", err)
+	}
 
 	pool, err := NewPool(ctx, dsn)
 	if err != nil {

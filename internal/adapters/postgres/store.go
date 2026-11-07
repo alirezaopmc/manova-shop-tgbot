@@ -9,16 +9,15 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/refund"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
 )
 
@@ -27,7 +26,8 @@ var (
 	ErrNotImplemented = errors.New("postgres: method not implemented")
 
 	// ErrNotFound is returned when a requested record does not exist in the database.
-	ErrNotFound = errors.New("postgres: record not found")
+	// Aliased to memory.ErrNotFound for cross-adapter compatibility.
+	ErrNotFound = memory.ErrNotFound
 )
 
 // Compile-time assertions verifying all sub-repositories and the Store implement port interfaces.
@@ -149,39 +149,6 @@ func (s *Store) Billing() port.BillingRepository     { return s.billing }
 func (s *Store) FxRates() port.FxRateSource          { return s.fxRates }
 
 // --- Sub-repository scaffolding stubs ---
-
-type userRepo struct{ s *Store }
-
-func (r *userRepo) GetByID(_ context.Context, _ int64) (*user.User, error) {
-	return nil, ErrNotImplemented
-}
-func (r *userRepo) FindByPhoneHash(_ context.Context, _ string) (*user.User, error) {
-	return nil, ErrNotImplemented
-}
-func (r *userRepo) Save(_ context.Context, _ *user.User) error {
-	return ErrNotImplemented
-}
-func (r *userRepo) Count(_ context.Context) (int64, error) {
-	return 0, ErrNotImplemented
-}
-func (r *userRepo) ListUsers(_ context.Context, _ int) ([]user.User, error) {
-	return nil, ErrNotImplemented
-}
-
-type inviteRepo struct{ s *Store }
-
-func (r *inviteRepo) Create(_ context.Context, _ *invite.Invite) error {
-	return ErrNotImplemented
-}
-func (r *inviteRepo) GetByCode(_ context.Context, _ string) (*invite.Invite, error) {
-	return nil, ErrNotImplemented
-}
-func (r *inviteRepo) Claim(_ context.Context, _ string, _ int64, _ time.Time) (*invite.Invite, error) {
-	return nil, ErrNotImplemented
-}
-func (r *inviteRepo) ListByCreator(_ context.Context, _ int64) ([]invite.Invite, error) {
-	return nil, ErrNotImplemented
-}
 
 type walletRepo struct{ s *Store }
 
