@@ -329,6 +329,17 @@ func (r *walletRepo) RecordLedgerEntry(_ context.Context, entry *wallet.LedgerEn
 	return nil
 }
 
+// LedgerEntries returns a snapshot of all recorded ledger entries.
+func (s *Store) LedgerEntries() []wallet.LedgerEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]wallet.LedgerEntry, len(s.ledger))
+	for i, e := range s.ledger {
+		out[i] = *e
+	}
+	return out
+}
+
 func (r *walletRepo) UpdateBalances(_ context.Context, w *wallet.Wallet) error {
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()

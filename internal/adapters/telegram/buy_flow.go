@@ -19,42 +19,78 @@ import (
 )
 
 type buyDraft struct {
-	PlanID     string
-	Location   string
-	Distro     string
-	OSImage    string
-	AccessMode string // "pwd" or "ssh"
-	SSHKey     string
-	Awaiting   string // "ssh_key"
-	CreatedAt  time.Time
+	PlanID     string    `json:"plan_id,omitempty"`
+	Location   string    `json:"location,omitempty"`
+	Distro     string    `json:"distro,omitempty"`
+	OSImage    string    `json:"os_image,omitempty"`
+	AccessMode string    `json:"access_mode,omitempty"` // "pwd" or "ssh"
+	SSHKey     string    `json:"ssh_key,omitempty"`
+	Awaiting   string    `json:"awaiting,omitempty"` // "ssh_key"
+	CreatedAt  time.Time `json:"created_at,omitempty"`
 }
 
 func (s *Service) getBuyDraft(userID int64) *buyDraft {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	d, ok := s.buyDrafts[userID]
-	if !ok || d == nil {
+	s.mu.RUnlock()
+	if ok && d != nil {
+		if time.Since(d.CreatedAt) <= 2*time.Hour {
+			return d
+		}
+		s.clearBuyDraft(userID)
 		return nil
 	}
-	if time.Since(d.CreatedAt) > 2*time.Hour {
-		return nil
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var loaded buyDraft
+		step, found, err := conv.GetConversationState(ctx, userID, "buy", &loaded)
+		if err == nil && found {
+			if loaded.CreatedAt.IsZero() {
+				loaded.CreatedAt = time.Now().UTC()
+			}
+			if loaded.Awaiting == "" && step != "" {
+				loaded.Awaiting = step
+			}
+			s.mu.Lock()
+			s.buyDrafts[userID] = &loaded
+			s.mu.Unlock()
+			return &loaded
+		}
 	}
-	return d
+	return nil
 }
 
 func (s *Service) setBuyDraft(userID int64, d *buyDraft) {
+	if d == nil {
+		s.clearBuyDraft(userID)
+		return
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if d.CreatedAt.IsZero() {
 		d.CreatedAt = time.Now().UTC()
 	}
 	s.buyDrafts[userID] = d
+	s.mu.Unlock()
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = conv.SaveConversationState(ctx, userID, "buy", d.Awaiting, d, time.Now().UTC().Add(2*time.Hour))
+	}
 }
 
 func (s *Service) clearBuyDraft(userID int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.buyDrafts, userID)
+	s.mu.Unlock()
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = conv.DeleteConversationState(ctx, userID, "buy")
+	}
 }
 
 func validateSSHPublicKey(raw string) (string, error) {
@@ -376,6 +412,13 @@ func (s *Service) sendBuyStep4Confirm(ctx context.Context, chatID telego.ChatID,
 
 // Step 5: Provisioning Execution
 func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, userID int64, planID, location, osImage, accessMode string) error {
+	// In-flight buy lock to prevent double-click server creation
+	if _, loaded := s.inFlightBuys.LoadOrStore(userID, struct{}{}); loaded {
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "⏳ درخواست خرید سرور شما در حال پردازش است، لطفاً کمی صبر فرمایید..."))
+		return nil
+	}
+	defer s.inFlightBuys.Delete(userID)
+
 	usr, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil || usr == nil {
 		return s.sendAccessDenied(ctx, chatID)
@@ -464,6 +507,20 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		// Rollback debit on provider failure
 		w.BalanceIRT += initialBlockIRT
 		_ = s.store.Wallets().UpdateBalances(ctx, w)
+
+		// Compensating ledger entry to preserve accounting balance invariant: Balance == sum(Ledger Amounts)
+		_ = s.store.Wallets().RecordLedgerEntry(ctx, &wallet.LedgerEntry{
+			ID:           fmt.Sprintf("led-rev-%d", time.Now().UnixNano()),
+			WalletID:     w.ID,
+			Currency:     wallet.CurrencyIRT,
+			Amount:       int64(initialBlockIRT),
+			Kind:         wallet.KindUsageReversal,
+			BalanceAfter: int64(w.BalanceIRT),
+			RefType:      "order",
+			RefID:        ord.ID,
+			CreatedAt:    time.Now().UTC(),
+		})
+
 		ord.Status = order.StateFulfillmentFailed
 		_ = s.store.Orders().Save(ctx, ord, nil)
 

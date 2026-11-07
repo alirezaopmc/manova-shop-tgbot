@@ -2,6 +2,11 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,8 +15,12 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/hetzner"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/receipt"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/config"
 )
 
@@ -342,5 +351,360 @@ func TestBuyExecutionAndServerManagement(t *testing.T) {
 	}
 	if resListAfterDelete[0].ID != res2.ID {
 		t.Fatalf("expected remaining resource to be res2")
+	}
+}
+
+type failingProvider struct {
+	port.CloudProvider
+	failErr error
+}
+
+func (f *failingProvider) HasToken() bool { return true }
+func (f *failingProvider) CreateServer(ctx context.Context, name string, serverType string, imageName string, location string, sshKeyIDs []string) (*port.ProviderCreateResult, error) {
+	return nil, f.failErr
+}
+
+func TestBuyExecutionAccountingRollbackOnFailure(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	cfg := &config.Config{
+		RateSpreadIRTPerUSD: 5000,
+		SupportHandle:       "@manova_support",
+	}
+
+	failErr := errors.New("simulated hetzner provisioning timeout")
+	failProv := &failingProvider{failErr: failErr}
+	svc := NewService(nil, cfg, store, failProv)
+
+	userID := int64(778899)
+	usr := user.New(userID, "tester", "Test", "User", user.RoleUser, time.Now().UTC())
+	_ = store.Users().Save(ctx, usr)
+
+	initialBalance := pricing.IRT(1_000_000)
+	w, _ := store.Wallets().GetByUserID(ctx, userID)
+	w.BalanceIRT = initialBalance
+	_ = store.Wallets().UpdateBalances(ctx, w)
+
+	err := svc.handleBuyExecute(ctx, tu.ID(userID), userID, "cx23", "nbg1", "ubuntu-24.04", "pwd")
+	if err != nil {
+		t.Fatalf("expected nil error (graceful failure response), got %v", err)
+	}
+
+	// 1. Verify wallet balance was refunded back to initial balance
+	wAfter, _ := store.Wallets().GetByUserID(ctx, userID)
+	if wAfter.BalanceIRT != initialBalance {
+		t.Fatalf("expected balance refunded to %d, got %d", initialBalance, wAfter.BalanceIRT)
+	}
+
+	// 2. Verify ledger contains compensating KindUsageReversal entry
+	entries := store.LedgerEntries()
+	if len(entries) != 2 {
+		t.Fatalf("expected exactly 2 ledger entries (purchase debit + rollback credit), got %d", len(entries))
+	}
+
+	debitEntry := entries[0]
+	if debitEntry.Kind != wallet.KindPurchase || debitEntry.Amount >= 0 {
+		t.Fatalf("expected negative purchase entry, got kind=%s amount=%d", debitEntry.Kind, debitEntry.Amount)
+	}
+
+	reversalEntry := entries[1]
+	if reversalEntry.Kind != wallet.KindUsageReversal {
+		t.Fatalf("expected KindUsageReversal entry, got %s", reversalEntry.Kind)
+	}
+	if reversalEntry.Amount != -debitEntry.Amount {
+		t.Fatalf("expected reversal amount %d to equal debit amount %d", reversalEntry.Amount, -debitEntry.Amount)
+	}
+	if reversalEntry.BalanceAfter != int64(initialBalance) {
+		t.Fatalf("expected BalanceAfter %d, got %d", initialBalance, reversalEntry.BalanceAfter)
+	}
+	if reversalEntry.RefType != "order" || reversalEntry.RefID == "" {
+		t.Fatalf("expected RefType=order and non-empty RefID, got RefType=%s RefID=%s", reversalEntry.RefType, reversalEntry.RefID)
+	}
+
+	// Invariant: sum of ledger amounts must equal 0 (no net change)
+	sum := debitEntry.Amount + reversalEntry.Amount
+	if sum != 0 {
+		t.Fatalf("ledger invariant broken: sum of ledger amounts is %d (expected 0)", sum)
+	}
+
+	// 3. Verify no provisioned resources exist
+	resList, _ := store.Billing().ListUserResources(ctx, userID)
+	if len(resList) != 0 {
+		t.Fatalf("expected 0 resources created, got %d", len(resList))
+	}
+}
+
+type slowProvider struct {
+	port.CloudProvider
+	callCount int32
+	delay     time.Duration
+}
+
+func (s *slowProvider) HasToken() bool { return true }
+func (s *slowProvider) CreateServer(ctx context.Context, name string, serverType string, imageName string, location string, sshKeyIDs []string) (*port.ProviderCreateResult, error) {
+	atomic.AddInt32(&s.callCount, 1)
+	time.Sleep(s.delay)
+	return &port.ProviderCreateResult{
+		ExternalID:  "srv-12345",
+		IPv4Address: "192.168.1.100",
+		Status:      "running",
+	}, nil
+}
+
+func TestBuyExecutionConcurrentDoublePurchasePrevention(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	cfg := &config.Config{
+		RateSpreadIRTPerUSD: 5000,
+		SupportHandle:       "@manova_support",
+	}
+
+	simProvider := hetzner.NewClient(hetzner.Config{SimulationMode: true})
+	slowProv := &slowProvider{
+		CloudProvider: simProvider,
+		delay:         50 * time.Millisecond,
+	}
+	svc := NewService(nil, cfg, store, slowProv)
+
+	userID := int64(556677)
+	usr := user.New(userID, "tester", "Test", "User", user.RoleUser, time.Now().UTC())
+	_ = store.Users().Save(ctx, usr)
+
+	// Fund wallet with enough for 2 servers
+	w, _ := store.Wallets().GetByUserID(ctx, userID)
+	w.BalanceIRT = 2_000_000
+	_ = store.Wallets().UpdateBalances(ctx, w)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = svc.handleBuyExecute(ctx, tu.ID(userID), userID, "cx23", "nbg1", "ubuntu-24.04", "pwd")
+	}()
+	go func() {
+		defer wg.Done()
+		_ = svc.handleBuyExecute(ctx, tu.ID(userID), userID, "cx23", "nbg1", "ubuntu-24.04", "pwd")
+	}()
+	wg.Wait()
+
+	// Exactly ONE server must be created
+	if slowProv.callCount != 1 {
+		t.Fatalf("expected CreateServer to be called exactly once, called %d times", slowProv.callCount)
+	}
+
+	resList, _ := store.Billing().ListUserResources(ctx, userID)
+	if len(resList) != 1 {
+		t.Fatalf("expected 1 active resource, got %d", len(resList))
+	}
+}
+
+func TestConcurrentReceiptApproval(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	cfg := &config.Config{
+		RateSpreadIRTPerUSD: 5000,
+		SupportHandle:       "@manova_support",
+	}
+	svc := NewService(nil, cfg, store)
+
+	userID := int64(12345)
+	usr := user.New(userID, "tester", "Test", "User", user.RoleUser, time.Now().UTC())
+	_ = store.Users().Save(ctx, usr)
+
+	// User wallet starts at 0
+	w, _ := store.Wallets().GetByUserID(ctx, userID)
+	w.BalanceIRT = 0
+	_ = store.Wallets().UpdateBalances(ctx, w)
+
+	rcptID := "rcpt-test-concurrency"
+	rcp := &receipt.Receipt{
+		ID:        rcptID,
+		UserID:    userID,
+		Purpose:   receipt.PurposeWalletTopup,
+		AmountIRT: 500_000,
+		Status:    receipt.StatusPendingReview,
+		CreatedAt: time.Now().UTC(),
+	}
+	_ = store.Receipts().Save(ctx, rcp)
+
+	// Simulate 10 concurrent approval clicks
+	var wg sync.WaitGroup
+	concurrency := 10
+	cbMsg := &telego.Message{Chat: telego.Chat{ID: userID}}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			cb := &telego.CallbackQuery{
+				ID:      fmt.Sprintf("cb_%d", idx),
+				From:    telego.User{ID: 999}, // Admin ID
+				Message: cbMsg,
+			}
+			_ = svc.handleReceiptApproval(ctx, cb, rcptID, 500_000)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify wallet was credited EXACTLY once (500,000 IRT), NOT 10 times!
+	wFinal, err := store.Wallets().GetByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("get wallet failed: %v", err)
+	}
+	if wFinal.BalanceIRT != 500_000 {
+		t.Fatalf("expected wallet balance 500,000 IRT, got %d IRT", wFinal.BalanceIRT)
+	}
+
+	// Verify receipt status is Approved
+	rcpFinal, err := store.Receipts().GetByID(ctx, rcptID)
+	if err != nil {
+		t.Fatalf("get receipt failed: %v", err)
+	}
+	if rcpFinal.Status != receipt.StatusApproved {
+		t.Fatalf("expected receipt status Approved, got %s", rcpFinal.Status)
+	}
+
+	// Verify exactly ONE ledger entry was recorded
+	entries := store.LedgerEntries()
+	var topupEntries []wallet.LedgerEntry
+	for _, e := range entries {
+		if e.Kind == wallet.KindTopupReceipt && e.RefID == rcptID {
+			topupEntries = append(topupEntries, e)
+		}
+	}
+	if len(topupEntries) != 1 {
+		t.Fatalf("expected exactly 1 ledger entry for receipt %s, got %d", rcptID, len(topupEntries))
+	}
+	if topupEntries[0].Amount != 500_000 {
+		t.Fatalf("expected ledger entry amount 500,000, got %d", topupEntries[0].Amount)
+	}
+}
+
+type mockConversationStore struct {
+	mu     sync.Mutex
+	states map[string]mockConvEntry
+}
+
+type mockConvEntry struct {
+	step      string
+	data      []byte
+	expiresAt time.Time
+}
+
+func newMockConversationStore() *mockConversationStore {
+	return &mockConversationStore{
+		states: make(map[string]mockConvEntry),
+	}
+}
+
+func (m *mockConversationStore) SaveConversationState(_ context.Context, userID int64, flow string, step string, data any, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, _ := json.Marshal(data)
+	key := fmt.Sprintf("%d:%s", userID, flow)
+	m.states[key] = mockConvEntry{step: step, data: b, expiresAt: expiresAt}
+	return nil
+}
+
+func (m *mockConversationStore) GetConversationState(_ context.Context, userID int64, flow string, dest any) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%d:%s", userID, flow)
+	e, ok := m.states[key]
+	if !ok {
+		return "", false, nil
+	}
+	if !e.expiresAt.IsZero() && time.Now().After(e.expiresAt) {
+		delete(m.states, key)
+		return "", false, nil
+	}
+	if dest != nil && len(e.data) > 0 {
+		_ = json.Unmarshal(e.data, dest)
+	}
+	return e.step, true, nil
+}
+
+func (m *mockConversationStore) DeleteConversationState(_ context.Context, userID int64, flow string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%d:%s", userID, flow)
+	delete(m.states, key)
+	return nil
+}
+
+type storeWithConversations struct {
+	*memory.Store
+	conv conversationStore
+}
+
+func (s *storeWithConversations) Conversations() conversationStore {
+	return s.conv
+}
+
+func TestConversationStorePersistenceAndRecovery(t *testing.T) {
+	memStore := memory.NewStore()
+	mockConv := newMockConversationStore()
+	swc := &storeWithConversations{Store: memStore, conv: mockConv}
+
+	cfg := &config.Config{
+		RateSpreadIRTPerUSD: 5000,
+		SupportHandle:       "@manova_support",
+	}
+
+	simProvider := hetzner.NewClient(hetzner.Config{SimulationMode: true})
+	svc := NewService(nil, cfg, swc, simProvider)
+
+	userID := int64(998877)
+
+	// 1. Set buy draft and pending topup on service
+	draft := &buyDraft{
+		PlanID:     "cx23",
+		Location:   "nbg1",
+		Distro:     "ubuntu",
+		OSImage:    "ubuntu-24.04",
+		AccessMode: "ssh",
+		SSHKey:     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+		Awaiting:   "ssh_key",
+		CreatedAt:  time.Now().UTC(),
+	}
+	svc.setBuyDraft(userID, draft)
+	svc.setPendingTopup(userID, 750_000)
+
+	// 2. Simulate bot crash / restart:
+	// New service instance with completely empty in-memory maps
+	restartedSvc := NewService(nil, cfg, swc, simProvider)
+
+	// Verify in-memory maps are empty initially
+	restartedSvc.mu.RLock()
+	if len(restartedSvc.buyDrafts) != 0 || len(restartedSvc.pendingTopups) != 0 {
+		t.Fatalf("expected empty memory maps in restarted service")
+	}
+	restartedSvc.mu.RUnlock()
+
+	// 3. Recover buy draft across restart
+	recoveredDraft := restartedSvc.getBuyDraft(userID)
+	if recoveredDraft == nil {
+		t.Fatalf("expected buy draft to be recovered from conversation store")
+	}
+	if recoveredDraft.PlanID != "cx23" || recoveredDraft.Location != "nbg1" || recoveredDraft.Awaiting != "ssh_key" {
+		t.Fatalf("recovered draft mismatch: %+v", recoveredDraft)
+	}
+
+	// 4. Recover pending topup across restart
+	recoveredTopup := restartedSvc.getPendingTopup(userID)
+	if recoveredTopup != 750_000 {
+		t.Fatalf("expected recovered topup 750,000, got %d", recoveredTopup)
+	}
+
+	// 5. Test cleanups propagate to store
+	restartedSvc.clearBuyDraft(userID)
+	restartedSvc.clearPendingTopup(userID)
+
+	if d := restartedSvc.getBuyDraft(userID); d != nil {
+		t.Fatalf("expected nil buy draft after clear, got %+v", d)
+	}
+	if amt := restartedSvc.getPendingTopup(userID); amt != 0 {
+		t.Fatalf("expected 0 topup after clear, got %d", amt)
 	}
 }

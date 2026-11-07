@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/hetzner"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/memory"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/adapters/postgres"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/application/port"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
@@ -26,23 +28,31 @@ import (
 )
 
 type pendingTopup struct {
-	AmountIRT int64
-	CreatedAt time.Time
+	AmountIRT int64     `json:"amount_irt"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type conversationStore interface {
+	SaveConversationState(ctx context.Context, userID int64, flow string, step string, data any, expiresAt time.Time) error
+	GetConversationState(ctx context.Context, userID int64, flow string, dest any) (step string, found bool, err error)
+	DeleteConversationState(ctx context.Context, userID int64, flow string) error
 }
 
 // Service runs the Telegram bot adapter over long polling.
 type Service struct {
-	bot           *telego.Bot
-	cfg           *config.Config
-	store         *memory.Store
-	provider      port.CloudProvider
-	botUsername   string
-	mu            sync.RWMutex
-	pendingTopups map[int64]*pendingTopup
-	buyDrafts     map[int64]*buyDraft
+	bot              *telego.Bot
+	cfg              *config.Config
+	store            port.Store
+	provider         port.CloudProvider
+	botUsername      string
+	mu               sync.RWMutex
+	pendingTopups    map[int64]*pendingTopup
+	buyDrafts        map[int64]*buyDraft
+	inFlightBuys     sync.Map
+	inFlightReceipts sync.Map
 }
 
-func NewService(bot *telego.Bot, cfg *config.Config, store *memory.Store, provider ...port.CloudProvider) *Service {
+func NewService(bot *telego.Bot, cfg *config.Config, store port.Store, provider ...port.CloudProvider) *Service {
 	var prov port.CloudProvider
 	if len(provider) > 0 && provider[0] != nil {
 		prov = provider[0]
@@ -64,26 +74,69 @@ func NewService(bot *telego.Bot, cfg *config.Config, store *memory.Store, provid
 	}
 }
 
+func (s *Service) convStore() conversationStore {
+	if s.store == nil {
+		return nil
+	}
+	if cs, ok := s.store.(conversationStore); ok {
+		return cs
+	}
+	type hasConversations interface {
+		Conversations() *postgres.ConversationStore
+	}
+	if hc, ok := s.store.(hasConversations); ok && hc != nil {
+		return hc.Conversations()
+	}
+	type hasConvInterface interface {
+		Conversations() conversationStore
+	}
+	if hc, ok := s.store.(hasConvInterface); ok && hc != nil {
+		return hc.Conversations()
+	}
+	return nil
+}
+
 func (s *Service) setPendingTopup(userID int64, amount int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pendingTopups[userID] = &pendingTopup{
+	top := &pendingTopup{
 		AmountIRT: amount,
 		CreatedAt: time.Now().UTC(),
+	}
+	s.mu.Lock()
+	s.pendingTopups[userID] = top
+	s.mu.Unlock()
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = conv.SaveConversationState(ctx, userID, "topup", "amount", top, time.Now().UTC().Add(2*time.Hour))
 	}
 }
 
 func (s *Service) getPendingTopup(userID int64) int64 {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	p, ok := s.pendingTopups[userID]
-	if !ok || p == nil {
+	s.mu.RUnlock()
+	if ok && p != nil {
+		if time.Since(p.CreatedAt) <= 2*time.Hour {
+			return p.AmountIRT
+		}
+		s.clearPendingTopup(userID)
 		return 0
 	}
-	if time.Since(p.CreatedAt) > 2*time.Hour {
-		return 0
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var loaded pendingTopup
+		_, found, err := conv.GetConversationState(ctx, userID, "topup", &loaded)
+		if err == nil && found {
+			s.mu.Lock()
+			s.pendingTopups[userID] = &loaded
+			s.mu.Unlock()
+			return loaded.AmountIRT
+		}
 	}
-	return p.AmountIRT
+	return 0
 }
 
 func (s *Service) sendMessage(ctx context.Context, p *telego.SendMessageParams) (*telego.Message, error) {
@@ -109,8 +162,14 @@ func (s *Service) answerCallbackQuery(ctx context.Context, p *telego.AnswerCallb
 
 func (s *Service) clearPendingTopup(userID int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.pendingTopups, userID)
+	s.mu.Unlock()
+
+	if conv := s.convStore(); conv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = conv.DeleteConversationState(ctx, userID, "topup")
+	}
 }
 
 // Start initiates long polling and handles incoming updates until ctx is cancelled.
@@ -973,7 +1032,7 @@ func formatNumber(n int64) string {
 }
 
 func errorsIsNotFound(err error) bool {
-	return err == memory.ErrNotFound
+	return errors.Is(err, memory.ErrNotFound)
 }
 
 func (s *Service) handleInlineQuery(ctx context.Context, q *telego.InlineQuery) error {
@@ -1260,22 +1319,35 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 	adminID := cb.From.ID
 	now := time.Now().UTC()
 
+	// In-flight guard: ensure concurrent approvals on the same receipt fail gracefully
+	if _, loaded := s.inFlightReceipts.LoadOrStore(rcptID, struct{}{}); loaded {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید در حال پردازش توسط مدیر دیگری است."))
+		return nil
+	}
+	defer s.inFlightReceipts.Delete(rcptID)
+
 	rcp, err := s.store.Receipts().GetByID(ctx, rcptID)
 	if err != nil || rcp == nil {
-		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
 		return nil
 	}
 
 	if rcp.Status == receipt.StatusApproved || rcp.Status == receipt.StatusRejected {
-		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
 		return nil
 	}
 
 	if err := rcp.Approve(adminID, now); err != nil {
+		if errors.Is(err, receipt.ErrReceiptAlreadyDecided) {
+			_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
+			return nil
+		}
 		return err
 	}
 	rcp.AmountIRT = pricing.IRT(amountIRT)
-	_ = s.store.Receipts().Save(ctx, rcp)
+	if err := s.store.Receipts().Save(ctx, rcp); err != nil {
+		return err
+	}
 
 	// Credit user's wallet
 	w, err := s.store.Wallets().GetByUserID(ctx, rcp.UserID)
@@ -1294,6 +1366,8 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 		Amount:       amountIRT,
 		Kind:         wallet.KindTopupReceipt,
 		BalanceAfter: int64(w.BalanceIRT),
+		RefType:      "receipt",
+		RefID:        rcp.ID,
 		CreatedAt:    now,
 	})
 
@@ -1308,7 +1382,7 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 		rcp.ID,
 		formatNumber(int64(w.BalanceIRT)),
 	)
-	_, _ = s.bot.SendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
+	_, _ = s.sendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
 
 	// 2. Update Admin message
 	adminConfirm := fmt.Sprintf(
@@ -1327,13 +1401,17 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 		chatID := tu.ID(cb.Message.GetChat().ID)
 		msgID := cb.Message.GetMessageID()
 		if m := cb.Message.Message(); m != nil && len(m.Photo) > 0 {
-			_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
+			if s.bot != nil {
+				_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
+			}
 		} else {
-			_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
+			if s.bot != nil {
+				_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
+			}
 		}
 	}
 
-	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("رسید تایید و %s تومان شارژ شد.", formatNumber(amountIRT))))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText(fmt.Sprintf("رسید تایید و %s تومان شارژ شد.", formatNumber(amountIRT))))
 	return nil
 }
 
@@ -1341,18 +1419,29 @@ func (s *Service) handleReceiptRejection(ctx context.Context, cb *telego.Callbac
 	adminID := cb.From.ID
 	now := time.Now().UTC()
 
+	// In-flight guard: ensure concurrent actions on the same receipt fail gracefully
+	if _, loaded := s.inFlightReceipts.LoadOrStore(rcptID, struct{}{}); loaded {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید در حال پردازش توسط مدیر دیگری است."))
+		return nil
+	}
+	defer s.inFlightReceipts.Delete(rcptID)
+
 	rcp, err := s.store.Receipts().GetByID(ctx, rcptID)
 	if err != nil || rcp == nil {
-		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("❌ رسید یافت نشد."))
 		return nil
 	}
 
 	if rcp.Status == receipt.StatusApproved || rcp.Status == receipt.StatusRejected {
-		_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
 		return nil
 	}
 
 	if err := rcp.Reject(adminID, receipt.RejectOther, "Rejected by admin", now); err != nil {
+		if errors.Is(err, receipt.ErrReceiptAlreadyDecided) {
+			_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("⚠️ این رسید قبلاً تعیین وضعیت شده است."))
+			return nil
+		}
 		return err
 	}
 	_ = s.store.Receipts().Save(ctx, rcp)
@@ -1365,7 +1454,7 @@ func (s *Service) handleReceiptRejection(ctx context.Context, cb *telego.Callbac
 		rcp.ID,
 		s.cfg.SupportHandle,
 	)
-	_, _ = s.bot.SendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
+	_, _ = s.sendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
 
 	// Update Admin message
 	adminReject := fmt.Sprintf(
@@ -1377,13 +1466,17 @@ func (s *Service) handleReceiptRejection(ctx context.Context, cb *telego.Callbac
 		chatID := tu.ID(cb.Message.GetChat().ID)
 		msgID := cb.Message.GetMessageID()
 		if m := cb.Message.Message(); m != nil && len(m.Photo) > 0 {
-			_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
+			if s.bot != nil {
+				_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
+			}
 		} else {
-			_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
+			if s.bot != nil {
+				_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
+			}
 		}
 	}
 
-	_ = s.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("رسید رد شد."))
+	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("رسید رد شد."))
 	return nil
 }
 
