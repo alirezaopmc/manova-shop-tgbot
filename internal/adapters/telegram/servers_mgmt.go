@@ -3,6 +3,8 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"html"
+	"log/slog"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/user"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/crypto"
 )
 
 // List user's active servers
@@ -60,6 +63,22 @@ func (s *Service) sendUserServersList(ctx context.Context, chatID telego.ChatID,
 	return err
 }
 
+// checkServerOwnership validates that the user owns the server or is an administrator.
+func (s *Service) checkServerOwnership(ctx context.Context, chatID int64, userID int64, res *billing.ProvisionedResource) (bool, error) {
+	if res != nil && res.UserID == userID {
+		return true, nil
+	}
+	usr, err := s.store.Users().GetByID(ctx, userID)
+	if err == nil && usr != nil && usr.Role == user.RoleAdmin {
+		return true, nil
+	}
+	if s.cfg != nil && s.cfg.AdminTelegramID != 0 && userID == s.cfg.AdminTelegramID {
+		return true, nil
+	}
+	_ = s.sendAccessDenied(ctx, tu.ID(chatID))
+	return false, nil
+}
+
 // Server management view for a specific server
 func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.ChatID, resID string, userID int64) error {
 	res, err := s.store.Billing().GetResource(ctx, resID)
@@ -69,9 +88,8 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 	}
 
 	// Verify ownership or admin
-	usr, _ := s.store.Users().GetByID(ctx, userID)
-	if res.UserID != userID && (usr == nil || usr.Role != user.RoleAdmin) {
-		return s.sendAccessDenied(ctx, chatID)
+	if ok, err := s.checkServerOwnership(ctx, chatID.ID, userID, res); !ok {
+		return err
 	}
 
 	stateLabel := "🟢 Running"
@@ -83,7 +101,7 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 	if res.SSHKey != "" {
 		accessInfo = "🛡️ <b>SSH Key</b>"
 	} else if res.RootPassword != "" {
-		accessInfo = fmt.Sprintf("🔑 <b>Root Password:</b> <code>%s</code>", res.RootPassword)
+		accessInfo = "🔑 <b>Root Password:</b> <code>[Encrypted/Set]</code>"
 	} else {
 		accessInfo = "🔑 <i>Password generated (use Reset Password if needed)</i>"
 	}
@@ -97,14 +115,14 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 			"• IPv6: <code>%s</code>\n"+
 			"%s\n\n"+
 			"SSH: <code>ssh root@%s</code>",
-		res.ServerName,
+		html.EscapeString(res.ServerName),
 		stateLabel,
-		res.Location,
-		res.ImageName,
-		res.IPv4Address,
-		res.IPv6Address,
+		html.EscapeString(res.Location),
+		html.EscapeString(res.ImageName),
+		html.EscapeString(res.IPv4Address),
+		html.EscapeString(res.IPv6Address),
 		accessInfo,
-		res.IPv4Address,
+		html.EscapeString(res.IPv4Address),
 	)
 
 	var rows [][]telego.InlineKeyboardButton
@@ -152,6 +170,11 @@ func (s *Service) handleServerPowerOn(ctx context.Context, cb *telego.CallbackQu
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	_ = s.provider.PowerOn(ctx, res.ExternalID)
 	res.PowerState = billing.PowerStateRunning
 	_ = s.store.Billing().SaveResource(ctx, res)
@@ -166,6 +189,11 @@ func (s *Service) handleServerPowerOff(ctx context.Context, cb *telego.CallbackQ
 	if err != nil || res == nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("سرور یافت نشد."))
 		return nil
+	}
+
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
 	}
 
 	_ = s.provider.PowerOff(ctx, res.ExternalID)
@@ -184,6 +212,11 @@ func (s *Service) handleServerReboot(ctx context.Context, cb *telego.CallbackQue
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	_ = s.provider.Reboot(ctx, res.ExternalID)
 	res.PowerState = billing.PowerStateRunning
 	_ = s.store.Billing().SaveResource(ctx, res)
@@ -200,21 +233,43 @@ func (s *Service) handleServerResetPassword(ctx context.Context, cb *telego.Call
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	newPwd, err := s.provider.ResetPassword(ctx, res.ExternalID)
 	if err != nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("Error resetting root password."))
 		return nil
 	}
 
-	res.RootPassword = newPwd
+	rootPasswordToSave := newPwd
+	if s.cfg != nil && !s.cfg.CredentialKEK.IsZero() && s.cfg.CredentialKEK.Expose() != "" && newPwd != "" {
+		if encPwd, err := crypto.Encrypt(newPwd, s.cfg.CredentialKEK.Expose()); err == nil {
+			rootPasswordToSave = encPwd
+		} else {
+			slog.Error("failed to encrypt reset root password", "err", err)
+		}
+	}
+	res.RootPassword = rootPasswordToSave
 	_ = s.store.Billing().SaveResource(ctx, res)
 
 	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🔑 Root password reset."))
 
-	notice := fmt.Sprintf(
-		"🔑 <b>New Root Password (%s):</b>\n<code>%s</code>",
-		res.ServerName, newPwd,
-	)
+	revealURL := s.generateRevealURL(newPwd)
+	var notice string
+	if revealURL != "" {
+		notice = fmt.Sprintf(
+			"🔑 <b>New Root Password (%s):</b>\n<a href=\"%s\">Click to reveal</a> (Valid 15m)",
+			html.EscapeString(res.ServerName), revealURL,
+		)
+	} else {
+		notice = fmt.Sprintf(
+			"🔑 <b>New Root Password (%s):</b>\n<code>[Encrypted/Set]</code>",
+			html.EscapeString(res.ServerName),
+		)
+	}
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }
@@ -227,6 +282,11 @@ func (s *Service) handleServerRescue(ctx context.Context, cb *telego.CallbackQue
 		return nil
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	rescuePwd, err := s.provider.EnableRescue(ctx, res.ExternalID)
 	if err != nil {
 		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("Error enabling rescue mode."))
@@ -235,10 +295,19 @@ func (s *Service) handleServerRescue(ctx context.Context, cb *telego.CallbackQue
 
 	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🛟 Rescue mode enabled."))
 
-	notice := fmt.Sprintf(
-		"🛟 <b>Rescue Mode enabled (%s):</b>\n<code>%s</code>\n\nReboot server to boot into rescue system.",
-		res.ServerName, rescuePwd,
-	)
+	revealURL := s.generateRevealURL(rescuePwd)
+	var notice string
+	if revealURL != "" {
+		notice = fmt.Sprintf(
+			"🛟 <b>Rescue Mode enabled (%s):</b>\n🔑 One-time Password: <a href=\"%s\">Click to reveal</a> (Valid 15m)\n\nReboot server to boot into rescue system.",
+			html.EscapeString(res.ServerName), revealURL,
+		)
+	} else {
+		notice = fmt.Sprintf(
+			"🛟 <b>Rescue Mode enabled (%s):</b>\n\nReboot server to boot into rescue system.",
+			html.EscapeString(res.ServerName),
+		)
+	}
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
 }
@@ -249,10 +318,14 @@ func (s *Service) handleServerDeletePrompt(ctx context.Context, chatID telego.Ch
 		return s.sendUserServersList(ctx, chatID, userID)
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, chatID.ID, userID, res); !ok {
+		return err
+	}
+
 	text := fmt.Sprintf(
 		"⚠️ <b>Delete Server (%s - %s)</b>\n\n"+
 			"All data will be permanently erased. Billing stops immediately.",
-		res.ServerName, res.IPv4Address,
+		html.EscapeString(res.ServerName), html.EscapeString(res.IPv4Address),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -276,12 +349,17 @@ func (s *Service) handleServerDeleteConfirm(ctx context.Context, cb *telego.Call
 		return s.sendUserServersList(ctx, chatID, userID)
 	}
 
+	if ok, err := s.checkServerOwnership(ctx, cb.Message.GetChat().ID, userID, res); !ok {
+		_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("دسترسی غیرمجاز."))
+		return err
+	}
+
 	_ = s.provider.DeleteServer(ctx, res.ExternalID)
 	_ = s.store.Billing().UpdateResourceBillingEnd(ctx, res.ID, time.Now().UTC(), billing.ResourceStatusDeleted)
 
 	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🗑️ Server deleted."))
 
-	msg := fmt.Sprintf("✅ <b>%s deleted.</b> Billing stopped.", res.ServerName)
+	msg := fmt.Sprintf("✅ <b>%s deleted.</b> Billing stopped.", html.EscapeString(res.ServerName))
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, msg).WithParseMode(telego.ModeHTML))
 
 	return s.sendUserServersList(ctx, chatID, userID)

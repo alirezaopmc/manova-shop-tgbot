@@ -6,7 +6,6 @@ import (
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/billing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/catalog"
-	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/fee"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/invite"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/osimage"
@@ -18,9 +17,7 @@ import (
 )
 
 // FxRateSource abstracts market exchange rate providers (SwapWallet, Wallex).
-type FxRateSource interface {
-	FetchRate(ctx context.Context) (pricing.RateObservation, error)
-}
+type FxRateSource = pricing.FxRateSource
 
 // ProviderServerStatus holds current server facts from cloud provider.
 type ProviderServerStatus struct {
@@ -102,13 +99,7 @@ type Notifier interface {
 }
 
 // UserRepository handles user entity persistence.
-type UserRepository interface {
-	GetByID(ctx context.Context, userID int64) (*user.User, error)
-	FindByPhoneHash(ctx context.Context, phoneHash string) (*user.User, error)
-	Save(ctx context.Context, u *user.User) error
-	Count(ctx context.Context) (int64, error)
-	ListUsers(ctx context.Context, limit int) ([]user.User, error)
-}
+type UserRepository = user.Repository
 
 // InviteRepository handles onboarding tokens.
 type InviteRepository interface {
@@ -125,12 +116,7 @@ type OrderRepository interface {
 }
 
 // WalletRepository handles wallet and ledger persistence.
-type WalletRepository interface {
-	GetByUserID(ctx context.Context, userID int64) (*wallet.Wallet, error)
-	RecordLedgerEntry(ctx context.Context, entry *wallet.LedgerEntry) error
-	UpdateBalances(ctx context.Context, w *wallet.Wallet) error
-	DebitAtomic(ctx context.Context, userID int64, totalIRT pricing.IRT, segment fee.Segment, sellRate pricing.IRT, kind wallet.LedgerKind, refType, refID string) (*wallet.Wallet, error)
-}
+type WalletRepository = wallet.Repository
 
 // ReceiptRepository handles payment receipt persistence.
 type ReceiptRepository interface {
@@ -160,14 +146,7 @@ type OSCatalogRepository interface {
 }
 
 // BillingRepository handles minute postings and provisioned resources.
-type BillingRepository interface {
-	GetResource(ctx context.Context, resourceID string) (*billing.ProvisionedResource, error)
-	ListActiveResources(ctx context.Context) ([]billing.ProvisionedResource, error)
-	ListUserResources(ctx context.Context, userID int64) ([]billing.ProvisionedResource, error)
-	SaveResource(ctx context.Context, r *billing.ProvisionedResource) error
-	SaveMinutePosting(ctx context.Context, p *billing.MinutePosting) error
-	UpdateResourceBillingEnd(ctx context.Context, resourceID string, billingEnd time.Time, status billing.ResourceStatus) error
-}
+type BillingRepository = billing.Repository
 
 // Store aggregates all domain persistence repositories and rate feeds.
 type Store interface {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/order"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/wallet"
+	"github.com/alirezaopmc/manova-shop-tgbot/internal/platform/crypto"
 )
 
 type buyDraft struct {
@@ -153,7 +155,7 @@ func (s *Service) sendBuyStep1Location(ctx context.Context, chatID telego.ChatID
 		"🌍 <b>Location (Datacenter)</b>\n\n"+
 			"• Plan: <b>%s</b> (%d vCPU, %d GB RAM)\n"+
 			"Select datacenter location:",
-		it.Name, it.VCPU, it.RAMGB,
+		html.EscapeString(it.Name), it.VCPU, it.RAMGB,
 	)
 
 	locations, _ := s.provider.ListLocations(ctx)
@@ -201,7 +203,7 @@ func (s *Service) sendBuyStep2Distro(ctx context.Context, chatID telego.ChatID, 
 		"💿 <b>Operating System</b>\n\n"+
 			"• Plan: <b>%s</b> | Location: <b>%s</b>\n"+
 			"Select distribution:",
-		name, locationName(location),
+		html.EscapeString(name), html.EscapeString(locationName(location)),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -232,7 +234,7 @@ func (s *Service) sendBuyStep2Version(ctx context.Context, chatID telego.ChatID,
 	if distro == "debian" {
 		distroTitle = "Debian"
 	}
-	title := fmt.Sprintf("💿 <b>%s Version</b>\n\nSelect version:", distroTitle)
+	title := fmt.Sprintf("💿 <b>%s Version</b>\n\nSelect version:", html.EscapeString(distroTitle))
 
 	images, _ := s.provider.ListImages(ctx)
 	var rows [][]telego.InlineKeyboardButton
@@ -291,7 +293,7 @@ func (s *Service) sendBuyStep3Access(ctx context.Context, chatID telego.ChatID, 
 		"🔑 <b>Authentication</b>\n\n"+
 			"• Plan: <b>%s</b> | Location: <b>%s</b> | OS: <b>%s</b>\n\n"+
 			"Select authentication method:",
-		name, locationName(location), osImageLabel(image),
+		html.EscapeString(name), html.EscapeString(locationName(location)), html.EscapeString(osImageLabel(image)),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -374,10 +376,10 @@ func (s *Service) sendBuyStep4Confirm(ctx context.Context, chatID telego.ChatID,
 			"• Monthly Cap: <code>%s Toman</code>\n"+
 			"• Prepay (1st hour): <code>%s Toman</code>\n\n"+
 			"💼 <b>Wallet Balance:</b> <code>%s Toman</code>",
-		it.Name, it.VCPU, it.RAMGB, it.DiskGB,
-		locationName(draft.Location),
-		osImageLabel(draft.OSImage),
-		accessDesc,
+		html.EscapeString(it.Name), it.VCPU, it.RAMGB, it.DiskGB,
+		html.EscapeString(locationName(draft.Location)),
+		html.EscapeString(osImageLabel(draft.OSImage)),
+		html.EscapeString(accessDesc),
 		formatNumber(int64(hourlyIRT)),
 		formatNumber(int64(monthlyIRT)),
 		formatNumber(int64(initialBlockIRT)),
@@ -427,7 +429,7 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		return s.sendAccessDenied(ctx, chatID)
 	}
 	if usr.Blocked {
-		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ Your account is blocked: %s", s.cfg.SupportHandle)))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ Your account is blocked: %s", html.EscapeString(s.cfg.SupportHandle))))
 		return nil
 	}
 
@@ -540,12 +542,21 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 			})
 		}
 
-		errMsg := fmt.Sprintf("❌ <b>Hetzner Server Creation Failed</b>\n\n%v\n\nYour wallet balance has been refunded.", err)
+		errMsg := fmt.Sprintf("❌ <b>Hetzner Server Creation Failed</b>\n\n%s\n\nYour wallet balance has been refunded.", html.EscapeString(err.Error()))
 		_, _ = s.sendMessage(ctx, tu.Message(chatID, errMsg).WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
 	// 4. Save ProvisionedResource
+	rootPasswordToSave := createResult.RootPassword
+	if s.cfg != nil && !s.cfg.CredentialKEK.IsZero() && s.cfg.CredentialKEK.Expose() != "" && createResult.RootPassword != "" {
+		if encPwd, err := crypto.Encrypt(createResult.RootPassword, s.cfg.CredentialKEK.Expose()); err == nil {
+			rootPasswordToSave = encPwd
+		} else {
+			slog.Error("failed to encrypt root password", "err", err)
+		}
+	}
+
 	resID := fmt.Sprintf("res-%d", time.Now().UnixNano())
 	res := &billing.ProvisionedResource{
 		ID:             resID,
@@ -561,7 +572,7 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 		IPv6Address:    createResult.IPv6Address,
 		Location:       location,
 		ImageName:      osImage,
-		RootPassword:   createResult.RootPassword,
+		RootPassword:   rootPasswordToSave,
 		SSHKey:         savedSSHKey,
 		BillingStartAt: time.Now().UTC(),
 		CreatedAt:      time.Now().UTC(),
@@ -585,7 +596,12 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 	if accessMode == "ssh" {
 		credsSection = "• Auth: <b>SSH Key</b>\n• Username: <code>root</code>"
 	} else {
-		credsSection = fmt.Sprintf("• Username: <code>root</code>\n• Root Password:\n<code>%s</code>", createResult.RootPassword)
+		revealURL := s.generateRevealURL(createResult.RootPassword)
+		if revealURL != "" {
+			credsSection = fmt.Sprintf("• Username: <code>root</code>\n• 🔑 One-time Password: <a href=\"%s\">Click to reveal</a> (Valid 15m)", revealURL)
+		} else {
+			credsSection = "• Username: <code>root</code>\n• 🔑 One-time Password: <i>Generated</i>"
+		}
 	}
 
 	successText := fmt.Sprintf(
@@ -601,13 +617,14 @@ func (s *Service) handleBuyExecute(ctx context.Context, chatID telego.ChatID, us
 			"%s\n\n"+
 			"📌 <b>Connect:</b>\n"+
 			"<code>ssh root@%s</code>",
-		serverName, it.Name,
-		locationName(location),
-		osImageLabel(osImage),
-		createResult.IPv4Address,
-		createResult.IPv6Address,
+		html.EscapeString(serverName),
+		html.EscapeString(it.Name),
+		html.EscapeString(locationName(location)),
+		html.EscapeString(osImageLabel(osImage)),
+		html.EscapeString(createResult.IPv4Address),
+		html.EscapeString(createResult.IPv6Address),
 		credsSection,
-		createResult.IPv4Address,
+		html.EscapeString(createResult.IPv4Address),
 	)
 
 	markup := tu.InlineKeyboard(

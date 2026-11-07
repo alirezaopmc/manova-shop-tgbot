@@ -1,9 +1,15 @@
 package pricing
 
 import (
+	"context"
 	"errors"
 	"time"
 )
+
+// FxRateSource abstracts market exchange rate providers (SwapWallet, Wallex).
+type FxRateSource interface {
+	FetchRate(ctx context.Context) (RateObservation, error)
+}
 
 // MicroUSD represents money in integer micro-dollars ($1 = 1,000,000 micro-USD).
 type MicroUSD int64

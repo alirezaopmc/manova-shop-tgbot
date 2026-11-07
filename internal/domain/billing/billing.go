@@ -1,11 +1,22 @@
 package billing
 
 import (
+	"context"
 	"errors"
 	"time"
 
 	"github.com/alirezaopmc/manova-shop-tgbot/internal/domain/pricing"
 )
+
+// Repository handles minute postings and provisioned resources.
+type Repository interface {
+	GetResource(ctx context.Context, resourceID string) (*ProvisionedResource, error)
+	ListActiveResources(ctx context.Context) ([]ProvisionedResource, error)
+	ListUserResources(ctx context.Context, userID int64) ([]ProvisionedResource, error)
+	SaveResource(ctx context.Context, r *ProvisionedResource) error
+	SaveMinutePosting(ctx context.Context, p *MinutePosting) error
+	UpdateResourceBillingEnd(ctx context.Context, resourceID string, billingEnd time.Time, status ResourceStatus) error
+}
 
 // PowerState represents the operational state reported by provider.
 // Informational only — does not alter billing rates.
