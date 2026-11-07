@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"html"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -98,7 +99,7 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 	if res.SSHKey != "" {
 		accessInfo = "🛡️ <b>SSH Key</b>"
 	} else if res.RootPassword != "" {
-		accessInfo = fmt.Sprintf("🔑 <b>Root Password:</b> <code>%s</code>", res.RootPassword)
+		accessInfo = fmt.Sprintf("🔑 <b>Root Password:</b> <code>%s</code>", html.EscapeString(res.RootPassword))
 	} else {
 		accessInfo = "🔑 <i>Password generated (use Reset Password if needed)</i>"
 	}
@@ -112,14 +113,14 @@ func (s *Service) sendServerManagementView(ctx context.Context, chatID telego.Ch
 			"• IPv6: <code>%s</code>\n"+
 			"%s\n\n"+
 			"SSH: <code>ssh root@%s</code>",
-		res.ServerName,
+		html.EscapeString(res.ServerName),
 		stateLabel,
-		res.Location,
-		res.ImageName,
-		res.IPv4Address,
-		res.IPv6Address,
+		html.EscapeString(res.Location),
+		html.EscapeString(res.ImageName),
+		html.EscapeString(res.IPv4Address),
+		html.EscapeString(res.IPv6Address),
 		accessInfo,
-		res.IPv4Address,
+		html.EscapeString(res.IPv4Address),
 	)
 
 	var rows [][]telego.InlineKeyboardButton
@@ -248,7 +249,7 @@ func (s *Service) handleServerResetPassword(ctx context.Context, cb *telego.Call
 
 	notice := fmt.Sprintf(
 		"🔑 <b>New Root Password (%s):</b>\n<code>%s</code>",
-		res.ServerName, newPwd,
+		html.EscapeString(res.ServerName), html.EscapeString(newPwd),
 	)
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
@@ -277,7 +278,7 @@ func (s *Service) handleServerRescue(ctx context.Context, cb *telego.CallbackQue
 
 	notice := fmt.Sprintf(
 		"🛟 <b>Rescue Mode enabled (%s):</b>\n<code>%s</code>\n\nReboot server to boot into rescue system.",
-		res.ServerName, rescuePwd,
+		html.EscapeString(res.ServerName), html.EscapeString(rescuePwd),
 	)
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, notice).WithParseMode(telego.ModeHTML))
 	return s.sendServerManagementView(ctx, chatID, resID, userID)
@@ -296,7 +297,7 @@ func (s *Service) handleServerDeletePrompt(ctx context.Context, chatID telego.Ch
 	text := fmt.Sprintf(
 		"⚠️ <b>Delete Server (%s - %s)</b>\n\n"+
 			"All data will be permanently erased. Billing stops immediately.",
-		res.ServerName, res.IPv4Address,
+		html.EscapeString(res.ServerName), html.EscapeString(res.IPv4Address),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -330,7 +331,7 @@ func (s *Service) handleServerDeleteConfirm(ctx context.Context, cb *telego.Call
 
 	_ = s.answerCallbackQuery(ctx, tu.CallbackQuery(cb.ID).WithText("🗑️ Server deleted."))
 
-	msg := fmt.Sprintf("✅ <b>%s deleted.</b> Billing stopped.", res.ServerName)
+	msg := fmt.Sprintf("✅ <b>%s deleted.</b> Billing stopped.", html.EscapeString(res.ServerName))
 	_, _ = s.sendMessage(ctx, tu.Message(chatID, msg).WithParseMode(telego.ModeHTML))
 
 	return s.sendUserServersList(ctx, chatID, userID)

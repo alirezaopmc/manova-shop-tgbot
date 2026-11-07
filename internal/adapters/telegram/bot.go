@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/url"
 	"strconv"
@@ -52,6 +53,8 @@ type Service struct {
 	buyDrafts        map[int64]*buyDraft
 	inFlightBuys     sync.Map
 	inFlightReceipts sync.Map
+	onSendMessage    func(p *telego.SendMessageParams)
+	onSendPhoto      func(p *telego.SendPhotoParams)
 }
 
 func NewService(bot *telego.Bot, cfg *config.Config, store port.Store, provider ...port.CloudProvider) *Service {
@@ -142,10 +145,37 @@ func (s *Service) getPendingTopup(userID int64) int64 {
 }
 
 func (s *Service) sendMessage(ctx context.Context, p *telego.SendMessageParams) (*telego.Message, error) {
+	if s.onSendMessage != nil {
+		s.onSendMessage(p)
+	}
 	if s.bot == nil {
 		return &telego.Message{MessageID: 1}, nil
 	}
 	return s.bot.SendMessage(ctx, p)
+}
+
+func (s *Service) sendPhoto(ctx context.Context, p *telego.SendPhotoParams) (*telego.Message, error) {
+	if s.onSendPhoto != nil {
+		s.onSendPhoto(p)
+	}
+	if s.bot == nil {
+		return &telego.Message{MessageID: 1}, nil
+	}
+	return s.bot.SendPhoto(ctx, p)
+}
+
+func (s *Service) editMessageCaption(ctx context.Context, p *telego.EditMessageCaptionParams) (*telego.Message, error) {
+	if s.bot == nil {
+		return &telego.Message{MessageID: 1}, nil
+	}
+	return s.bot.EditMessageCaption(ctx, p)
+}
+
+func (s *Service) editMessageText(ctx context.Context, p *telego.EditMessageTextParams) (*telego.Message, error) {
+	if s.bot == nil {
+		return &telego.Message{MessageID: 1}, nil
+	}
+	return s.bot.EditMessageText(ctx, p)
 }
 
 func (s *Service) deleteMessage(ctx context.Context, p *telego.DeleteMessageParams) error {
@@ -196,15 +226,29 @@ func (s *Service) Start(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			if err := s.HandleUpdate(ctx, u); err != nil {
-				slog.Error("error handling update", "update_id", u.UpdateID, "error", err)
-			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("recovered from update panic", "panic", r, "update_id", u.UpdateID)
+					}
+				}()
+				if err := s.HandleUpdate(ctx, u); err != nil {
+					slog.Error("error handling update", "update_id", u.UpdateID, "error", err)
+				}
+			}()
 		}
 	}
 }
 
 // HandleUpdate processes a single Telegram update (message, callback query, or inline query).
-func (s *Service) HandleUpdate(ctx context.Context, u telego.Update) error {
+func (s *Service) HandleUpdate(ctx context.Context, u telego.Update) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("recovered from update panic", "panic", r, "update_id", u.UpdateID)
+			err = fmt.Errorf("panic in update handling: %v", r)
+		}
+	}()
+
 	if u.Message != nil {
 		return s.handleMessage(ctx, u.Message)
 	}
@@ -240,7 +284,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 
 	// Reject blocked users
 	if usr != nil && usr.Blocked {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب کاربری شما مسدود است. لطفاً با پشتیبانی در ارتباط باشید: %s", s.cfg.SupportHandle)))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب کاربری شما مسدود است. لطفاً با پشتیبانی در ارتباط باشید: %s", html.EscapeString(s.cfg.SupportHandle))))
 		return nil
 	}
 
@@ -262,7 +306,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 	// 3. Handle /admin command
 	if text == "/admin" {
 		if usr == nil || usr.Role != user.RoleAdmin {
-			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
 			return nil
 		}
 		return s.sendAdminPortal(ctx, chatID)
@@ -271,7 +315,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 	// 4. Handle /wallet command (admin only)
 	if strings.HasPrefix(text, "/wallet") {
 		if usr == nil || usr.Role != user.RoleAdmin {
-			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
 			return nil
 		}
 		return s.handleAdminWalletCommand(ctx, chatID, text)
@@ -280,7 +324,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 	// 5. Handle /user command (admin only)
 	if strings.HasPrefix(text, "/user") {
 		if usr == nil || usr.Role != user.RoleAdmin {
-			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, "⛔ شما به این بخش دسترسی ندارید."))
 			return nil
 		}
 		return s.handleAdminUserCommand(ctx, chatID, text)
@@ -307,7 +351,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *telego.Message) error 
 					tu.InlineKeyboardButton("❌ انصراف از خرید").WithCallbackData("buy:cancel"),
 				),
 			)
-			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, msgText).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, msgText).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 			return nil
 		}
 
@@ -336,7 +380,7 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 	// If user already enrolled:
 	if usr != nil {
 		if usr.Blocked {
-			_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب کاربری شما مسدود است. لطفاً با پشتیبانی در ارتباط باشید: %s", s.cfg.SupportHandle)))
+			_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("⛔ حساب کاربری شما مسدود است. لطفاً با پشتیبانی در ارتباط باشید: %s", html.EscapeString(s.cfg.SupportHandle))))
 			return nil
 		}
 		return s.sendMainMenu(ctx, chatID, usr)
@@ -351,8 +395,8 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 	// Validate and claim invite (strict verification)
 	inv, err := s.store.Invites().Claim(ctx, rawCode, userID, now)
 	if err != nil {
-		errMsg := fmt.Sprintf("❌ <b>کد دعوت نامعتبر است</b>\n\nکد وارد شده معتبر نیست، منقضی شده یا ظرفیت آن تکمیل شده است.\n\nبرای دریافت دعوت‌نامه جدید با پشتیبانی تماس بگیرید: %s", s.cfg.SupportHandle)
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, errMsg).WithParseMode(telego.ModeHTML))
+		errMsg := fmt.Sprintf("❌ <b>کد دعوت نامعتبر است</b>\n\nکد وارد شده معتبر نیست، منقضی شده یا ظرفیت آن تکمیل شده است.\n\nبرای دریافت دعوت‌نامه جدید با پشتیبانی تماس بگیرید: %s", html.EscapeString(s.cfg.SupportHandle))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, errMsg).WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
@@ -365,7 +409,7 @@ func (s *Service) handleStart(ctx context.Context, msg *telego.Message, usr *use
 	}
 
 	welcomeText := "🎉 <b>به فروشگاه مانوا خوش آمدید!</b>"
-	_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, welcomeText).WithParseMode(telego.ModeHTML))
+	_, _ = s.sendMessage(ctx, tu.Message(chatID, welcomeText).WithParseMode(telego.ModeHTML))
 
 	return s.sendMainMenu(ctx, chatID, newUser)
 }
@@ -382,14 +426,14 @@ func (s *Service) handleContact(ctx context.Context, msg *telego.Message) error 
 
 	// Verification check: contact must belong to sender
 	if msg.Contact.UserID != userID {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ شماره‌ای که ارسال کردید متعلق به حساب شما نیست. لطفاً فقط شماره خودتان را به اشتراک بگذارید."))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ شماره‌ای که ارسال کردید متعلق به حساب شما نیست. لطفاً فقط شماره خودتان را به اشتراک بگذارید."))
 		return nil
 	}
 
 	// Normalize Iranian number
 	phoneE164, err := user.NormalizeIranianPhone(msg.Contact.PhoneNumber)
 	if err != nil {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ شماره ارسال‌شده معتبر نیست. فقط شماره‌های همراه ایران (+989) پذیرفته می‌شوند."))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ شماره ارسال‌شده معتبر نیست. فقط شماره‌های همراه ایران (+989) پذیرفته می‌شوند."))
 		return nil
 	}
 
@@ -397,16 +441,16 @@ func (s *Service) handleContact(ctx context.Context, msg *telego.Message) error 
 	phoneHash := user.HashPhoneNumber(phoneE164, []byte(s.cfg.CredentialKEK.Expose()))
 	existing, _ := s.store.Users().FindByPhoneHash(ctx, phoneHash)
 	if existing != nil && existing.TelegramUserID != userID {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ این شماره قبلاً با حساب دیگری ثبت شده است. جهت بررسی با پشتیبانی %s تماس بگیرید.", s.cfg.SupportHandle)))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ این شماره قبلاً با حساب دیگری ثبت شده است. جهت بررسی با پشتیبانی %s تماس بگیرید.", html.EscapeString(s.cfg.SupportHandle))))
 		return nil
 	}
 
 	_ = usr.SetVerifiedPhone(phoneE164, phoneHash, now)
 	_ = s.store.Users().Save(ctx, usr)
 
-	successText := fmt.Sprintf("✅ <b>شماره موبایل شما با موفقیت تایید شد:</b>\n<code>%s</code>\n\nاکنون می‌توانید کیف پول خود را شارژ کرده یا سرور سفارش دهید.", phoneE164)
+	successText := fmt.Sprintf("✅ <b>شماره موبایل شما با موفقیت تایید شد:</b>\n<code>%s</code>\n\nاکنون می‌توانید کیف پول خود را شارژ کرده یا سرور سفارش دهید.", html.EscapeString(phoneE164))
 	removeKeyboard := tu.ReplyKeyboardRemove()
-	_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, successText).WithParseMode(telego.ModeHTML).WithReplyMarkup(removeKeyboard))
+	_, _ = s.sendMessage(ctx, tu.Message(chatID, successText).WithParseMode(telego.ModeHTML).WithReplyMarkup(removeKeyboard))
 
 	return s.sendMainMenu(ctx, chatID, usr)
 }
@@ -672,7 +716,7 @@ func (s *Service) sendMainMenu(ctx context.Context, chatID telego.ChatID, usr *u
 			"• وضعیت شماره موبایل: %s\n\n"+
 			"جهت خرید سرور ابری، شارژ حساب یا مدیریت خدمات از دکمه‌های زیر استفاده کنید:",
 		usr.TelegramUserID,
-		usr.Segment,
+		html.EscapeString(string(usr.Segment)),
 		phoneStatusLabel(usr.IsPhoneVerified()),
 	)
 
@@ -698,7 +742,7 @@ func (s *Service) sendMainMenu(ctx context.Context, chatID telego.ChatID, usr *u
 	}
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -716,7 +760,7 @@ func (s *Service) sendAdminPortal(ctx context.Context, chatID telego.ChatID) err
 			"• مارجین دلار: <code>%s تومان</code>",
 		userCount,
 		hcloudStatus,
-		s.cfg.CardHolderName,
+		html.EscapeString(s.cfg.CardHolderName),
 		formatNumber(int64(s.cfg.RateSpreadIRTPerUSD)),
 	)
 
@@ -734,7 +778,7 @@ func (s *Service) sendAdminPortal(ctx context.Context, chatID telego.ChatID) err
 		),
 	)
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -755,7 +799,7 @@ func (s *Service) sendInviteCreationPrompt(ctx context.Context, chatID telego.Ch
 		),
 	)
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -786,8 +830,8 @@ func (s *Service) handleGenerateInvite(ctx context.Context, chatID telego.ChatID
 			"• <b>ظرفیت:</b> %s\n"+
 			"• <b>لینک ورود مستقیم:</b>\n"+
 			"<code>%s</code>",
-		usesDesc,
-		deepLink,
+		html.EscapeString(usesDesc),
+		html.EscapeString(deepLink),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -803,7 +847,7 @@ func (s *Service) handleGenerateInvite(ctx context.Context, chatID telego.ChatID
 		),
 	)
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, cardText).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, cardText).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -840,7 +884,7 @@ func (s *Service) sendCatalog(ctx context.Context, chatID telego.ChatID) error {
 	))
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -860,7 +904,7 @@ func (s *Service) sendServerDetail(ctx context.Context, chatID telego.ChatID, it
 			"• <b>Specs:</b> %d vCPU | %d GB RAM | %d GB NVMe | 20 TB Traffic\n"+
 			"• <b>Hourly:</b> %s T/hr (%s T/min)\n"+
 			"• <b>Monthly max:</b> %s T/mo",
-		it.Name, it.VCPU, it.RAMGB, it.DiskGB,
+		html.EscapeString(it.Name), it.VCPU, it.RAMGB, it.DiskGB,
 		formatNumber(int64(hourlyIRT)), formatNumber(int64(hourlyIRT/60)),
 		formatNumber(int64(monthlyIRT)),
 	)
@@ -874,7 +918,7 @@ func (s *Service) sendServerDetail(ctx context.Context, chatID telego.ChatID, it
 		),
 	)
 
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -909,7 +953,7 @@ func (s *Service) sendWallet(ctx context.Context, chatID telego.ChatID, userID i
 		),
 	)
 
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -940,7 +984,7 @@ func (s *Service) sendTopupAmountPrompt(ctx context.Context, chatID telego.ChatI
 		),
 	)
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -954,7 +998,7 @@ func (s *Service) sendTopupPaymentDetails(ctx context.Context, chatID telego.Cha
 			"پس از انتقال مبلغ <b>%s تومان</b>، لطفاً تصویر فیش یا اسکرین‌شات رسید را همین‌جا در چت ارسال فرمایید تا کیف پول شما تایید و شارژ گردد.\n\n"+
 			"<i>(اگر مبلغ واریزی شما متفاوت است، می‌توانید مبلغ جدید را تایپ و ارسال فرمایید)</i>",
 		formatNumber(amountIRT),
-		s.cfg.CardHolderName,
+		html.EscapeString(s.cfg.CardHolderName),
 		formatNumber(amountIRT),
 	)
 
@@ -965,7 +1009,7 @@ func (s *Service) sendTopupPaymentDetails(ctx context.Context, chatID telego.Cha
 		),
 	)
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -979,7 +1023,7 @@ func (s *Service) sendPhonePrompt(ctx context.Context, chatID telego.ChatID) err
 		tu.KeyboardRow(contactBtn),
 	).WithResizeKeyboard()
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -988,7 +1032,7 @@ func (s *Service) sendSupport(ctx context.Context, chatID telego.ChatID) error {
 		"ℹ️ <b>پشتیبانی و راهنمایی</b>\n\n"+
 			"در صورت بروز هرگونه سوال، نیاز به مشاوره یا گزارش مشکل، می‌توانید با پشتیبانی رسمی در ارتباط باشید:\n\n"+
 			"👤 پشتیبانی: %s",
-		s.cfg.SupportHandle,
+		html.EscapeString(s.cfg.SupportHandle),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -997,14 +1041,14 @@ func (s *Service) sendSupport(ctx context.Context, chatID telego.ChatID) error {
 		),
 	)
 
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
 func (s *Service) sendAccessDenied(ctx context.Context, chatID telego.ChatID) error {
 	supportHandle := ""
 	if s.cfg != nil {
-		supportHandle = s.cfg.SupportHandle
+		supportHandle = html.EscapeString(s.cfg.SupportHandle)
 	}
 	text := fmt.Sprintf(
 		"🔒 <b>ورود اختصاصی با دعوت‌نامه</b>\n\n"+
@@ -1200,7 +1244,7 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 	}
 
 	if fileID == "" {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ فایل ارسالی معتبر نیست."))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ فایل ارسالی معتبر نیست."))
 		return nil
 	}
 
@@ -1245,10 +1289,10 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 			"%s"+
 			"• <b>وضعیت:</b> در انتظار بررسی مدیریت ⏳\n\n"+
 			"رسید شما جهت بررسی و تایید برای مدیریت ارسال گردید. به محض تایید، موجودی کیف پول شما شارژ خواهد شد.",
-		rcptID,
+		html.EscapeString(rcptID),
 		amtDesc,
 	)
-	_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, ackText).WithParseMode(telego.ModeHTML))
+	_, _ = s.sendMessage(ctx, tu.Message(chatID, ackText).WithParseMode(telego.ModeHTML))
 
 	// Forward to Admin
 	if s.cfg.AdminTelegramID != 0 {
@@ -1261,15 +1305,15 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 				"• 💰 <b>مبلغ اعلام‌شده توسط کاربر:</b> <b>%s</b>\n"+
 				"• <b>زمان:</b> <code>%s</code>",
 			userID,
-			msg.From.Username,
-			msg.From.FirstName,
-			msg.From.LastName,
-			rcptID,
+			html.EscapeString(msg.From.Username),
+			html.EscapeString(msg.From.FirstName),
+			html.EscapeString(msg.From.LastName),
+			html.EscapeString(rcptID),
 			amtLabel(amountIRT),
 			now.Format("2006-01-02 15:04:05 UTC"),
 		)
 		if msg.Caption != "" {
-			caption += fmt.Sprintf("\n• <b>توضیحات کاربر:</b> <i>%s</i>", msg.Caption)
+			caption += fmt.Sprintf("\n• <b>توضیحات کاربر:</b> <i>%s</i>", html.EscapeString(msg.Caption))
 		}
 
 		var adminMarkup *telego.InlineKeyboardMarkup
@@ -1307,12 +1351,12 @@ func (s *Service) handleReceiptUpload(ctx context.Context, msg *telego.Message, 
 		}
 
 		if len(msg.Photo) > 0 {
-			_, _ = s.bot.SendPhoto(ctx, tu.Photo(adminChatID, tu.FileFromID(fileID)).
+			_, _ = s.sendPhoto(ctx, tu.Photo(adminChatID, tu.FileFromID(fileID)).
 				WithCaption(caption).
 				WithParseMode(telego.ModeHTML).
 				WithReplyMarkup(adminMarkup))
 		} else {
-			_, _ = s.bot.SendMessage(ctx, tu.Message(adminChatID, caption).
+			_, _ = s.sendMessage(ctx, tu.Message(adminChatID, caption).
 				WithParseMode(telego.ModeHTML).
 				WithReplyMarkup(adminMarkup))
 		}
@@ -1353,7 +1397,7 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 			"• <b>موجودی جدید کیف پول:</b> <code>%s تومان</code>\n\n"+
 			"هم‌اکنون می‌توانید سرور ابری مورد نظر خود را خریداری فرمایید.",
 		formatNumber(amountIRT),
-		rcp.ID,
+		html.EscapeString(rcp.ID),
 		formatNumber(int64(w.BalanceIRT)),
 	)
 	_, _ = s.sendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
@@ -1365,7 +1409,7 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 			"• به کیف پول کاربر <code>%d</code> افزوده شد.\n"+
 			"• موجودی فعلی: <code>%s تومان</code>\n"+
 			"• زمان تایید: %s",
-		rcptID,
+		html.EscapeString(rcptID),
 		formatNumber(amountIRT),
 		rcp.UserID,
 		formatNumber(int64(w.BalanceIRT)),
@@ -1375,13 +1419,9 @@ func (s *Service) handleReceiptApproval(ctx context.Context, cb *telego.Callback
 		chatID := tu.ID(cb.Message.GetChat().ID)
 		msgID := cb.Message.GetMessageID()
 		if m := cb.Message.Message(); m != nil && len(m.Photo) > 0 {
-			if s.bot != nil {
-				_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
-			}
+			_, _ = s.editMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
 		} else {
-			if s.bot != nil {
-				_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
-			}
+			_, _ = s.editMessageText(ctx, tu.EditMessageText(chatID, msgID, adminConfirm).WithParseMode(telego.ModeHTML))
 		}
 	}
 
@@ -1425,28 +1465,24 @@ func (s *Service) handleReceiptRejection(ctx context.Context, cb *telego.Callbac
 		"❌ <b>رسید پرداخت شما تایید نشد</b>\n\n"+
 			"• <b>شناسه رسید:</b> <code>%s</code>\n\n"+
 			"رسید ارسالی توسط مدیریت تایید نگردید. در صورت کسر وجه از حسابتان یا نیاز به پیگیری، با پشتیبانی (%s) در ارتباط باشید.",
-		rcp.ID,
-		s.cfg.SupportHandle,
+		html.EscapeString(rcp.ID),
+		html.EscapeString(s.cfg.SupportHandle),
 	)
 	_, _ = s.sendMessage(ctx, tu.Message(tu.ID(rcp.UserID), userNotice).WithParseMode(telego.ModeHTML))
 
 	// Update Admin message
 	adminReject := fmt.Sprintf(
 		"❌ <b>رسید %s رد شد</b>\nکاربر: <code>%d</code>",
-		rcptID,
+		html.EscapeString(rcptID),
 		rcp.UserID,
 	)
 	if cb.Message != nil {
 		chatID := tu.ID(cb.Message.GetChat().ID)
 		msgID := cb.Message.GetMessageID()
 		if m := cb.Message.Message(); m != nil && len(m.Photo) > 0 {
-			if s.bot != nil {
-				_, _ = s.bot.EditMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
-			}
+			_, _ = s.editMessageCaption(ctx, tu.EditMessageCaption(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
 		} else {
-			if s.bot != nil {
-				_, _ = s.bot.EditMessageText(ctx, tu.EditMessageText(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
-			}
+			_, _ = s.editMessageText(ctx, tu.EditMessageText(chatID, msgID, adminReject).WithParseMode(telego.ModeHTML))
 		}
 	}
 
@@ -1463,7 +1499,7 @@ func (s *Service) sendAdminReceiptOtherAmounts(ctx context.Context, chatID teleg
 	text := fmt.Sprintf(
 		"✏️ <b>انتخاب مبلغ برای تایید رسید %s</b>\n\n"+
 			"مبلغ مورد نظر جهت شارژ را انتخاب فرمایید:",
-		rcptID,
+		html.EscapeString(rcptID),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -1484,7 +1520,7 @@ func (s *Service) sendAdminReceiptOtherAmounts(ctx context.Context, chatID teleg
 		),
 	)
 
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -1568,14 +1604,14 @@ func (s *Service) sendAdminWalletsList(ctx context.Context, chatID telego.ChatID
 	))
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
 func (s *Service) sendAdminUserWalletView(ctx context.Context, chatID telego.ChatID, targetUserID int64) error {
 	u, err := s.store.Users().GetByID(ctx, targetUserID)
 	if err != nil || u == nil {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ کاربری با شناسه <code>%d</code> یافت نشد.", targetUserID)).WithParseMode(telego.ModeHTML))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ کاربری با شناسه <code>%d</code> یافت نشد.", targetUserID)).WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
@@ -1594,10 +1630,10 @@ func (s *Service) sendAdminUserWalletView(ctx context.Context, chatID telego.Cha
 			"• تومانی: <code>%s تومان</code>\n"+
 			"• دلاری: <code>%0.2f USD</code>\n\n"+
 			"عملیات مورد نظر را انتخاب فرمایید:",
-		u.FirstName, u.LastName,
-		u.Username,
+		html.EscapeString(u.FirstName), html.EscapeString(u.LastName),
+		html.EscapeString(u.Username),
 		u.TelegramUserID,
-		u.Segment,
+		html.EscapeString(string(u.Segment)),
 		formatNumber(int64(w.BalanceIRT)),
 		float64(w.BalanceUSDMicro)/1_000_000.0,
 	)
@@ -1615,7 +1651,7 @@ func (s *Service) sendAdminUserWalletView(ctx context.Context, chatID telego.Cha
 		),
 	)
 
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -1671,7 +1707,7 @@ func (s *Service) sendAdminWalletAdjustMenu(ctx context.Context, chatID telego.C
 	))
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, title).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, title).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -1734,11 +1770,11 @@ func (s *Service) handleAdminWalletAdjustExec(ctx context.Context, cb *telego.Ca
 			"• <b>عملیات:</b> %s\n"+
 			"• <b>میزان تغییر:</b> <code>%s</code>\n"+
 			"• <b>موجودی جدید شما:</b> <code>%s تومان</code>",
-		opDesc,
-		deltaText,
+		html.EscapeString(opDesc),
+		html.EscapeString(deltaText),
 		formatNumber(int64(w.BalanceIRT)),
 	)
-	_, _ = s.bot.SendMessage(ctx, tu.Message(tu.ID(targetUserID), userNotice).WithParseMode(telego.ModeHTML))
+	_, _ = s.sendMessage(ctx, tu.Message(tu.ID(targetUserID), userNotice).WithParseMode(telego.ModeHTML))
 
 	// 2. Alert admin and return to wallet view
 	confirmMsg := fmt.Sprintf("موجودی با موفقیت بروزرسانی شد. جدید: %s تومان", formatNumber(int64(w.BalanceIRT)))
@@ -1755,7 +1791,7 @@ func (s *Service) handleAdminWalletCommand(ctx context.Context, chatID telego.Ch
 
 	targetUID, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ شناسه کاربری نامعتبر است. فرمت صحیح: <code>/wallet 12345678</code>").WithParseMode(telego.ModeHTML))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ شناسه کاربری نامعتبر است. فرمت صحیح: <code>/wallet 12345678</code>").WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
@@ -1773,7 +1809,7 @@ func (s *Service) sendUserSettings(ctx context.Context, chatID telego.ChatID, us
 
 	phoneText := "❌ تایید نشده"
 	if usr.IsPhoneVerified() && usr.PhoneE164 != nil {
-		phoneText = fmt.Sprintf("✅ تایید شده (%s)", *usr.PhoneE164)
+		phoneText = fmt.Sprintf("✅ تایید شده (%s)", html.EscapeString(*usr.PhoneE164))
 	}
 
 	regDate := usr.CreatedAt.Format("2006-01-02 15:04")
@@ -1788,9 +1824,9 @@ func (s *Service) sendUserSettings(ctx context.Context, chatID telego.ChatID, us
 			"• <b>وضعیت موبایل:</b> %s\n"+
 			"• <b>تاریخ عضویت:</b> %s",
 		usr.TelegramUserID,
-		usr.FirstName, usr.LastName,
-		usr.Username,
-		usr.Segment,
+		html.EscapeString(usr.FirstName), html.EscapeString(usr.LastName),
+		html.EscapeString(usr.Username),
+		html.EscapeString(string(usr.Segment)),
 		discount,
 		phoneText,
 		regDate,
@@ -1807,7 +1843,7 @@ func (s *Service) sendUserSettings(ctx context.Context, chatID telego.ChatID, us
 	))
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err := s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err := s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -1847,14 +1883,14 @@ func (s *Service) sendAdminUsersList(ctx context.Context, chatID telego.ChatID) 
 	))
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
 func (s *Service) sendAdminUserDetailView(ctx context.Context, chatID telego.ChatID, targetUserID int64) error {
 	u, err := s.store.Users().GetByID(ctx, targetUserID)
 	if err != nil || u == nil {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ کاربری با شناسه <code>%d</code> یافت نشد.", targetUserID)).WithParseMode(telego.ModeHTML))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, fmt.Sprintf("❌ کاربری با شناسه <code>%d</code> یافت نشد.", targetUserID)).WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
@@ -1876,7 +1912,7 @@ func (s *Service) sendAdminUserDetailView(ctx context.Context, chatID telego.Cha
 
 	phoneStr := "❌ ثبت نشده"
 	if u.IsPhoneVerified() && u.PhoneE164 != nil {
-		phoneStr = fmt.Sprintf("✅ %s", *u.PhoneE164)
+		phoneStr = fmt.Sprintf("✅ %s", html.EscapeString(*u.PhoneE164))
 	}
 
 	var invitedByStr string
@@ -1888,7 +1924,7 @@ func (s *Service) sendAdminUserDetailView(ctx context.Context, chatID telego.Cha
 
 	var inviteCodeStr string
 	if u.InviteCode != nil {
-		inviteCodeStr = fmt.Sprintf("<code>%s</code>", *u.InviteCode)
+		inviteCodeStr = fmt.Sprintf("<code>%s</code>", html.EscapeString(*u.InviteCode))
 	} else {
 		inviteCodeStr = "-"
 	}
@@ -1907,11 +1943,11 @@ func (s *Service) sendAdminUserDetailView(ctx context.Context, chatID telego.Cha
 			"• <b>تاریخ عضویت:</b> %s\n\n"+
 			"جهت اعمال تغییرات در مشخصات کاربر، گزینه‌های زیر را انتخاب فرمایید:",
 		u.TelegramUserID,
-		u.FirstName, u.LastName,
-		u.Username,
+		html.EscapeString(u.FirstName), html.EscapeString(u.LastName),
+		html.EscapeString(u.Username),
 		statusStr,
 		roleStr,
-		u.Segment,
+		html.EscapeString(string(u.Segment)),
 		phoneStr,
 		formatNumber(balIRT),
 		inviteCodeStr, invitedByStr,
@@ -1956,7 +1992,7 @@ func (s *Service) sendAdminUserDetailView(ctx context.Context, chatID telego.Cha
 	))
 
 	markup := tu.InlineKeyboard(rows...)
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -1974,7 +2010,7 @@ func (s *Service) sendAdminUserSegmentMenu(ctx context.Context, chatID telego.Ch
 			"• <b>NEW:</b> کارمزد پایه ۱۰٪ (کاربران جدید)\n"+
 			"• <b>CUSTOMER:</b> کارمزد ویژه ۳٪ (مشتریان عادی)\n"+
 			"• <b>LOYAL:</b> کارمزد وفادار ۱٪ (مشتریان برتر)",
-		u.FirstName, u.TelegramUserID, u.Segment,
+		html.EscapeString(u.FirstName), u.TelegramUserID, html.EscapeString(string(u.Segment)),
 	)
 
 	markup := tu.InlineKeyboard(
@@ -1988,7 +2024,7 @@ func (s *Service) sendAdminUserSegmentMenu(ctx context.Context, chatID telego.Ch
 		),
 	)
 
-	_, err = s.bot.SendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
+	_, err = s.sendMessage(ctx, tu.Message(chatID, text).WithParseMode(telego.ModeHTML).WithReplyMarkup(markup))
 	return err
 }
 
@@ -2095,7 +2131,7 @@ func (s *Service) handleAdminUserCommand(ctx context.Context, chatID telego.Chat
 
 	targetUID, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		_, _ = s.bot.SendMessage(ctx, tu.Message(chatID, "❌ شناسه کاربری نامعتبر است. فرمت صحیح: <code>/user 12345678</code>").WithParseMode(telego.ModeHTML))
+		_, _ = s.sendMessage(ctx, tu.Message(chatID, "❌ شناسه کاربری نامعتبر است. فرمت صحیح: <code>/user 12345678</code>").WithParseMode(telego.ModeHTML))
 		return nil
 	}
 
