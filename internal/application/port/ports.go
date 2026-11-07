@@ -165,3 +165,17 @@ type BillingRepository interface {
 	SaveMinutePosting(ctx context.Context, p *billing.MinutePosting) error
 	UpdateResourceBillingEnd(ctx context.Context, resourceID string, billingEnd time.Time, status billing.ResourceStatus) error
 }
+
+// Store aggregates all domain persistence repositories and rate feeds.
+type Store interface {
+	Users() UserRepository
+	Invites() InviteRepository
+	Wallets() WalletRepository
+	Orders() OrderRepository
+	Receipts() ReceiptRepository
+	Refunds() RefundRepository
+	Catalog() CatalogRepository
+	OSCatalog() OSCatalogRepository
+	Billing() BillingRepository
+	FxRates() FxRateSource
+}

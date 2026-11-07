@@ -153,6 +153,8 @@ func NewStore() *Store {
 }
 
 // Sub-repository accessors
+var _ port.Store = (*Store)(nil)
+
 func (s *Store) Users() port.UserRepository          { return &userRepo{s} }
 func (s *Store) Invites() port.InviteRepository      { return &inviteRepo{s} }
 func (s *Store) Wallets() port.WalletRepository      { return &walletRepo{s} }
