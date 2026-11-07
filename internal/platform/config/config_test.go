@@ -97,4 +97,19 @@ func TestDatabaseDSN(t *testing.T) {
 	if got := cfg.DatabaseDSN(); got != "postgres://envuser:envpass@envhost:5432/envdb?sslmode=verify-full" {
 		t.Fatalf("expected env DSN, got %q", got)
 	}
+	_ = os.Unsetenv("DATABASE_URL")
+
+	// URL encoding with reserved URI characters in password & username
+	cfgSpecial := &Config{
+		DBHost:     "127.0.0.1",
+		DBPort:     5432,
+		DBUser:     "shop:user",
+		DBName:     "shop_db",
+		DBSSLMode:  "disable",
+		DBPassword: secrets.New("p@ss:w/o?r#d%1"),
+	}
+	expectedSpecial := "postgres://shop%3Auser:p%40ss%3Aw%2Fo%3Fr%23d%251@127.0.0.1:5432/shop_db?sslmode=disable"
+	if got := cfgSpecial.DatabaseDSN(); got != expectedSpecial {
+		t.Fatalf("expected encoded DSN %q, got %q", expectedSpecial, got)
+	}
 }

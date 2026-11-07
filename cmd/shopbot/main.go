@@ -45,7 +45,7 @@ func main() {
 
 	var store botStore
 
-	if os.Getenv("DATABASE_HOST") == "" && os.Getenv("DATABASE_URL") == "" && cfg.DBHost == "" {
+	if cfg.DatabaseURL == "" && cfg.DBHost == "" {
 		slog.Warn("DATABASE_HOST and DATABASE_URL not set; falling back to in-memory store for local dev")
 		store = memory.NewStore()
 	} else {

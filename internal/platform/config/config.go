@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -107,8 +108,16 @@ func (c *Config) DatabaseDSN() string {
 	if sslMode == "" {
 		sslMode = "disable"
 	}
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		user, c.DBPassword.Expose(), host, port, dbname, sslMode)
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(user, c.DBPassword.Expose()),
+		Host:   fmt.Sprintf("%s:%d", host, port),
+		Path:   dbname,
+	}
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // LoadFromEnv loads configuration from environment variables with sensible defaults.
